@@ -5,17 +5,32 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
+use chrono::NaiveTime;
 use serde::Deserialize;
+
+use crate::display::Schedule;
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    /// IANA time zone for the clock, the monitor schedule and `until` times, e.g.
+    /// "Europe/Warsaw". Unset: the host's zone.
+    pub timezone: Option<String>,
     pub hermes: HermesConfig,
     pub tasks: TasksConfig,
     pub brightness: BrightnessConfig,
     pub metrics: MetricsConfig,
+    pub display: DisplayConfig,
     pub ui: UiConfig,
+}
+
+/// Daily monitor standby. Times are "HH:MM"; either may be left out.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DisplayConfig {
+    pub off_at: Option<String>,
+    pub on_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -167,7 +182,53 @@ impl Config {
             self.tasks.finished_rows > 0,
             "tasks.finished_rows must be > 0"
         );
+        let schedule = self.try_schedule()?;
+        ensure!(
+            schedule.off_at.is_none() || schedule.off_at != schedule.on_at,
+            "display.off_at and display.on_at must differ"
+        );
+        if let Some(tz) = &self.timezone {
+            ensure!(
+                !tz.is_empty() && !tz.starts_with('/') && !tz.contains(".."),
+                "timezone must be an IANA name like \"Europe/Warsaw\", got {tz:?}"
+            );
+            ensure!(
+                Path::new(ZONEINFO).join(tz).is_file(),
+                "timezone {tz:?} not found in {ZONEINFO}"
+            );
+        }
         Ok(())
+    }
+
+    /// The monitor's daily schedule (validated at load).
+    pub fn schedule(&self) -> Schedule {
+        self.try_schedule().unwrap_or_default()
+    }
+
+    fn try_schedule(&self) -> Result<Schedule> {
+        let parse = |key: &str, v: &Option<String>| -> Result<Option<NaiveTime>> {
+            match v.as_deref().map(str::trim) {
+                None | Some("") => Ok(None),
+                Some(t) => match NaiveTime::parse_from_str(t, "%H:%M") {
+                    Ok(t) => Ok(Some(t)),
+                    Err(_) => bail!("display.{key} must be a time like \"23:00\", got {t:?}"),
+                },
+            }
+        };
+        Ok(Schedule {
+            off_at: parse("off_at", &self.display.off_at)?,
+            on_at: parse("on_at", &self.display.on_at)?,
+        })
+    }
+
+    /// Makes `timezone` the process's local zone (chrono reads `TZ`). Call it first
+    /// thing in `main`, while the process is still single-threaded.
+    pub fn apply_timezone(&self) {
+        if let Some(tz) = &self.timezone {
+            // SAFETY: called before any thread is spawned, so nothing reads the
+            // environment concurrently.
+            unsafe { std::env::set_var("TZ", tz) };
+        }
     }
 
     /// The Hermes home directory with `~/` expanded.
@@ -176,6 +237,8 @@ impl Config {
         expand_tilde(&self.hermes.home, dirs::home_dir())
     }
 }
+
+const ZONEINFO: &str = "/usr/share/zoneinfo";
 
 fn default_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("hermes-beaver").join("config.toml"))
@@ -249,6 +312,35 @@ mod tests {
     #[test]
     fn out_of_range_brightness_is_rejected() {
         assert!(Config::parse("[brightness]\nactive = 150").is_err());
+    }
+
+    #[test]
+    fn display_schedule_parses_and_validates() {
+        assert_eq!(Config::default().schedule(), Schedule::default());
+        let c = Config::parse("[display]\noff_at = \"23:00\"\non_at = \"09:00\"").unwrap();
+        assert_eq!(
+            c.schedule(),
+            Schedule {
+                off_at: NaiveTime::from_hms_opt(23, 0, 0),
+                on_at: NaiveTime::from_hms_opt(9, 0, 0),
+            }
+        );
+        let only_off = Config::parse("[display]\noff_at = \"22:30\"").unwrap();
+        assert_eq!(only_off.schedule().on_at, None);
+        let err = |text: &str| format!("{:#}", Config::parse(text).unwrap_err());
+        assert!(err("[display]\noff_at = \"11pm\"").contains("like \"23:00\""));
+        assert!(err("[display]\noff_at = \"09:00\"\non_at = \"09:00\"").contains("must differ"));
+    }
+
+    #[test]
+    fn timezone_must_exist() {
+        if !Path::new(ZONEINFO).join("UTC").is_file() {
+            return; // no tz database on this machine
+        }
+        assert!(Config::parse("timezone = \"UTC\"").is_ok());
+        let err = |text: &str| format!("{:#}", Config::parse(text).unwrap_err());
+        assert!(err("timezone = \"Mars/Olympus\"").contains("not found"));
+        assert!(err("timezone = \"../etc/passwd\"").contains("IANA name"));
     }
 
     #[test]

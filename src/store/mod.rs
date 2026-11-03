@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::display;
+
 #[cfg(test)]
 pub const SCHEMA_VERSION: i64 = 1;
 
@@ -163,6 +165,45 @@ impl Store {
     }
 }
 
+/// The owner's last monitor request (`display_off` / `display_on` / `display_vacation`).
+/// Kept in `meta` (keys `display`, `display_since`, `display_until`), so no migration is
+/// needed. An unknown value (from a newer binary) reads as the default.
+pub(crate) fn read_display(conn: &Connection) -> rusqlite::Result<display::Request> {
+    let get = |key: &str| {
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()
+    };
+    let Some(mode) = get("display")?.as_deref().and_then(display::Mode::parse) else {
+        return Ok(display::Request::default());
+    };
+    let num = |v: Option<String>| v.and_then(|v| v.parse().ok());
+    Ok(display::Request {
+        mode,
+        since: num(get("display_since")?).unwrap_or(0),
+        until: match mode {
+            display::Mode::Off => num(get("display_until")?),
+            _ => None,
+        },
+    })
+}
+
+pub(crate) fn write_display(conn: &Connection, req: &display::Request) -> rusqlite::Result<()> {
+    let put = |key: &str, value: Option<String>| match value {
+        Some(v) => conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            params![key, v],
+        ),
+        None => conn.execute("DELETE FROM meta WHERE key = ?1", [key]),
+    };
+    put("display", Some(req.mode.as_str().to_owned()))?;
+    put("display_since", Some(req.since.to_string()))?;
+    let until = req.until.filter(|_| req.mode == display::Mode::Off);
+    put("display_until", until.map(|u| u.to_string()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +214,40 @@ mod tests {
         assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
         assert!(s.go_live_at().unwrap() > 0);
         assert_eq!(s.last_event_id().unwrap(), 0);
+    }
+
+    #[test]
+    fn display_request_round_trips() {
+        use display::{Mode, Request};
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(read_display(&s.conn).unwrap(), Request::default());
+        let off = Request {
+            mode: Mode::Off,
+            since: 100,
+            until: Some(500),
+        };
+        write_display(&s.conn, &off).unwrap();
+        assert_eq!(read_display(&s.conn).unwrap(), off);
+        let vacation = Request {
+            mode: Mode::Vacation,
+            since: 200,
+            until: Some(900), // only `off` keeps an end time
+        };
+        write_display(&s.conn, &vacation).unwrap();
+        assert_eq!(
+            read_display(&s.conn).unwrap(),
+            Request {
+                until: None,
+                ..vacation
+            }
+        );
+        // The first release stored only `display`; a missing `display_since` reads as 0.
+        s.conn
+            .execute_batch(
+                "DELETE FROM meta WHERE key LIKE 'display_%'; UPDATE meta SET value = 'on' WHERE key = 'display';",
+            )
+            .unwrap();
+        assert_eq!(read_display(&s.conn).unwrap(), Request::default());
     }
 
     #[test]
@@ -206,6 +281,7 @@ mod tests {
                     for i in 0..25 {
                         crate::tools::call(
                             &mut s,
+                            &Default::default(),
                             "task_start",
                             serde_json::json!({"source": "direct", "title": format!("t{n}-{i}")}),
                         )

@@ -1,5 +1,6 @@
 mod brightness;
 mod config;
+mod display;
 mod health;
 mod hermes;
 mod mask;
@@ -13,7 +14,8 @@ mod ui;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use serde_json::Value;
 
 use store::Store;
 use tools::ToolError;
@@ -56,7 +58,14 @@ enum Command {
         /// Tool name, e.g. task_start
         tool: String,
         /// Tool arguments as a JSON object
+        #[arg(default_value = "{}")]
         json: String,
+    },
+    /// Switch the dashboard's monitor and print one line for people, e.g. "Screen off
+    /// until tomorrow 09:00." Meant for Hermes quick commands. Exit status as for `call`.
+    Display {
+        #[arg(value_enum)]
+        action: DisplayAction,
     },
     /// Run the GUI against synthetic data, without touching Hermes.
     Demo {
@@ -66,9 +75,18 @@ enum Command {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DisplayAction {
+    On,
+    Off,
+    /// Off until turned on, ignoring the daily schedule.
+    Vacation,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = config::Config::load(cli.config.as_deref())?;
+    config.apply_timezone();
     let store_path = cli.store.clone().unwrap_or_else(Store::default_path);
 
     match cli.command {
@@ -88,42 +106,71 @@ fn main() -> Result<()> {
         ),
         Some(Command::Mcp) => {
             let mut store = Store::open(&store_path)?;
-            mcp::serve(&mut store)
+            mcp::serve(&mut store, &config.schedule())
         }
         Some(Command::Call { tool, json }) => {
-            std::process::exit(run_call(&store_path, &tool, &json))
+            std::process::exit(run_call(&store_path, &config.schedule(), &tool, &json))
+        }
+        Some(Command::Display { action }) => {
+            let tool = match action {
+                DisplayAction::On => "display_on",
+                DisplayAction::Off => "display_off",
+                DisplayAction::Vacation => "display_vacation",
+            };
+            let code = match run_tool(&store_path, &config.schedule(), tool, Value::Null) {
+                Ok(out) => {
+                    println!("{}", display::describe(&out, chrono::Local::now()));
+                    0
+                }
+                Err(code) => code,
+            };
+            std::process::exit(code)
         }
     }
 }
 
-fn run_call(store_path: &std::path::Path, tool: &str, json: &str) -> i32 {
-    let args: serde_json::Value = match serde_json::from_str(json) {
+fn run_call(
+    store_path: &std::path::Path,
+    schedule: &display::Schedule,
+    tool: &str,
+    json: &str,
+) -> i32 {
+    let args: Value = match serde_json::from_str(json) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("hermes-beaver call: arguments are not valid JSON: {e}");
             return 2;
         }
     };
-    let mut store = match Store::open(store_path).context("opening the store") {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("hermes-beaver call: {e:#}");
-            return 1;
-        }
-    };
-    match tools::call(&mut store, tool, args) {
+    match run_tool(store_path, schedule, tool, args) {
         Ok(out) => {
             println!("{out}");
             0
         }
-        Err(e) => {
-            eprintln!("hermes-beaver call: {e}");
-            match e {
-                ToolError::Internal(_) => 1,
-                _ => 2,
-            }
-        }
+        Err(code) => code,
     }
+}
+
+/// Runs one tool; on failure prints the reason and returns the exit status.
+fn run_tool(
+    store_path: &std::path::Path,
+    schedule: &display::Schedule,
+    tool: &str,
+    args: Value,
+) -> Result<Value, i32> {
+    let mut store = Store::open(store_path)
+        .context("opening the store")
+        .map_err(|e| {
+            eprintln!("hermes-beaver: {e:#}");
+            1
+        })?;
+    tools::call(&mut store, schedule, tool, args).map_err(|e| {
+        eprintln!("hermes-beaver: {e}");
+        match e {
+            ToolError::Internal(_) => 1,
+            _ => 2,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -146,6 +193,8 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+        let cli = Cli::parse_from(["hermes-beaver", "call", "display_on"]);
+        assert!(matches!(cli.command, Some(Command::Call { json, .. }) if json == "{}"));
     }
 
     #[test]
@@ -153,15 +202,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hb-call-{}", std::process::id()));
         let db = dir.join("events.db");
         assert_eq!(
-            run_call(&db, "task_start", r#"{"source":"direct","title":"x"}"#),
+            run_call(
+                &db,
+                &Default::default(),
+                "task_start",
+                r#"{"source":"direct","title":"x"}"#
+            ),
             0
         );
         assert_eq!(
-            run_call(&db, "task_start", r#"{"source":"nope","title":"x"}"#),
+            run_call(
+                &db,
+                &Default::default(),
+                "task_start",
+                r#"{"source":"nope","title":"x"}"#
+            ),
             2
         );
-        assert_eq!(run_call(&db, "no_such_tool", "{}"), 2);
-        assert_eq!(run_call(&db, "task_start", "{oops"), 2);
+        assert_eq!(run_call(&db, &Default::default(), "no_such_tool", "{}"), 2);
+        assert_eq!(run_call(&db, &Default::default(), "task_start", "{oops"), 2);
         std::fs::remove_dir_all(dir).ok();
     }
 }

@@ -14,6 +14,7 @@ use slint::{ComponentHandle, ModelRc, Rgba8Pixel, SharedPixelBuffer, Timer, Time
 
 use crate::brightness::{self, Controller, Levels};
 use crate::config::{Config, Renderer};
+use crate::display::{self, Change, Schedule, Screen};
 use crate::health::{self, Health};
 use crate::hermes::HermesReader;
 use crate::metrics::{self, Metrics, Source};
@@ -55,6 +56,9 @@ struct App {
     health: Option<Health>,
     last_event_id: Option<i64>,
     brightness: Option<Controller>,
+    /// Monitor power (live mode only).
+    screen: Option<Screen>,
+    schedule: Schedule,
 }
 
 pub fn run(
@@ -89,6 +93,7 @@ pub fn run(
 
     app.refresh(store::now());
     app.render(&window, store::now());
+    app.sync_screen(store::now());
     let app = Rc::new(RefCell::new(app));
 
     // Clock: check every second, touch the property (and redraw) only when it changes.
@@ -113,7 +118,12 @@ pub fn run(
                 a.sample_metrics();
                 let wake = a.refresh(store::now());
                 a.render(&w, store::now());
-                if wake && let Some(b) = &a.brightness {
+                let change = a.sync_screen(store::now());
+                // Events don't brighten a monitor in standby; turning it on does.
+                let off = a.screen.as_ref().is_some_and(Screen::is_off);
+                if (change == Change::TurnedOn || wake && !off)
+                    && let Some(b) = &a.brightness
+                {
                     b.wake();
                 }
             }
@@ -149,7 +159,8 @@ pub fn run(
 
     watch_signals();
     window.run().context("running the event loop")?;
-    // Dropping the app restores brightness (and removes the demo store).
+    // Dropping the app restores brightness, wakes the monitor if it's in standby
+    // and removes the demo store.
     drop(app);
     Ok(())
 }
@@ -171,6 +182,8 @@ impl App {
             health: None,
             last_event_id: None,
             brightness: None,
+            screen: None,
+            schedule: config.schedule(),
         };
         Ok(match mode {
             Mode::Live => {
@@ -195,6 +208,7 @@ impl App {
                     Levels::from(&config.brightness),
                     move || brightness::select(method),
                 ));
+                app.screen = Some(Screen::new(Box::new(display::Dpms)));
                 app
             }
             Mode::Demo(scenario) => {
@@ -282,6 +296,16 @@ impl App {
         wake
     }
 
+    /// Puts the monitor into standby or wakes it, following the owner's last request
+    /// and the daily schedule.
+    fn sync_screen(&mut self, now: i64) -> Change {
+        let want_off = display::wants_off(&self.snapshot.display, &self.schedule, now);
+        match &mut self.screen {
+            Some(s) => s.sync(want_off),
+            None => Change::None,
+        }
+    }
+
     fn render(&self, w: &MainWindow, now: i64) {
         let snap = &self.snapshot;
         let health = self.health.clone().unwrap_or_default();
@@ -329,7 +353,7 @@ fn db_stamp(db: &Path) -> (Option<SystemTime>, Option<SystemTime>) {
     (m(db), m(Path::new(&wal)))
 }
 
-/// SIGTERM/SIGINT/SIGHUP end the event loop cleanly, so brightness is restored.
+/// SIGTERM/SIGINT/SIGHUP end the event loop cleanly, so brightness and monitor power are restored.
 fn watch_signals() {
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
     let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGHUP]) else {

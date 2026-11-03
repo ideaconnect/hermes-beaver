@@ -368,3 +368,28 @@ Spike results and implementation details that changed the plan above:
 - **Reconciliation matches by `cron_job_id`.** Spike #4 confirmed every gate dispatch falls inside its own job's execution window. The two slots' windows overlap, so the job id is required. The ledger keeps about 19 hours.
 - **"Needs you" groups 2–4 are GitHub-only.** Only refs have a close lifecycle. A failed Telegram task shows under "Recently finished".
 - **The beaver's needs-you sign ignores PRs waiting for review.** There are usually some, and the sign would never come down. The caption still counts them.
+
+## 14. Added after v1
+
+- **Monitor standby.** There's no point lighting an empty room.
+  - **Tools:**
+    - `display_off`, with an optional `until`;
+    - `display_on`;
+    - `display_vacation`.
+
+    Like the other tools, they only write to the store: the request with its time, in `meta` keys `display`, `display_since` and `display_until`, plus an event.
+  - **Daily schedule:** `[display] off_at` / `on_at` in the config.
+  - **Who wins:** the latest of the owner's request and the last scheduled switch. A request holds until the next switch.
+    - An `off` with `until` holds until that time, even across a switch on, then hands back to the schedule.
+    - Vacation ignores the schedule until `display_on`.
+  - **Replies:** every result says when the state next changes by itself, so Hermes can confirm "off until 09:00".
+  - **`timezone`** in the config sets `TZ` at startup. The target runs on UTC while the owner is in Europe/Warsaw; this fixes the clock too, without touching the host's zone, which Hermes also uses.
+  - **Switching** happens on the GUI's tick, through X DPMS:
+    - `xset dpms force off` puts the monitor into standby. It also enables DPMS, with the X default 600 s timeouts.
+    - `xset -dpms` wakes the monitor and disables DPMS again, so X never blanks the dashboard by itself.
+    - Checked on the target: the HDMI connector goes Off and On, and DDC/CI still answers in standby.
+  - **Brightness:** in standby, events don't trigger the brightness boost. Waking gives the usual active minute.
+  - **Restarts:** a restart re-applies standby. Stopping the dashboard wakes the monitor.
+  - **Hermes:**
+    - quick commands `/sleep`, `/awake` and `/vacation` (zero tokens; `/wake` is a Hermes built-in) run `hermes-beaver display …`, which prints one line;
+    - a SOUL.md rule covers natural-language requests.

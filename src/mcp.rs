@@ -9,6 +9,7 @@ use std::io::{BufRead, Write};
 use anyhow::Result;
 use serde_json::{Value, json};
 
+use crate::display::Schedule;
 use crate::store::Store;
 use crate::tools::{self, ToolError};
 
@@ -19,10 +20,12 @@ const FALLBACK_VERSION: &str = "2025-06-18";
 const INSTRUCTIONS: &str = concat!(
     "Reports work to the hermes-beaver wall dashboard. Call task_start when you begin real work ",
     "for the owner, task_update with waiting_feedback when blocked on them, and task_finish when done. ",
+    "Call display_off when the owner goes to sleep or leaves the room, display_vacation when they leave for days, ",
+    "and display_on when they are back. ",
     "Never include secrets in any text."
 );
 
-pub fn serve(store: &mut Store) -> Result<()> {
+pub fn serve(store: &mut Store, schedule: &Schedule) -> Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -30,7 +33,7 @@ pub fn serve(store: &mut Store) -> Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(reply) = handle_line(store, &line) {
+        if let Some(reply) = handle_line(store, schedule, &line) {
             serde_json::to_writer(&mut stdout, &reply)?;
             stdout.write_all(b"\n")?;
             stdout.flush()?;
@@ -40,7 +43,7 @@ pub fn serve(store: &mut Store) -> Result<()> {
 }
 
 /// Handles one message; returns the response, or `None` for notifications.
-pub fn handle_line(store: &mut Store, line: &str) -> Option<Value> {
+pub fn handle_line(store: &mut Store, schedule: &Schedule, line: &str) -> Option<Value> {
     let msg: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => return Some(error(Value::Null, -32700, &format!("parse error: {e}"))),
@@ -86,7 +89,7 @@ pub fn handle_line(store: &mut Store, line: &str) -> Option<Value> {
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            match tools::call(store, name, args) {
+            match tools::call(store, schedule, name, args) {
                 Ok(out) => result(
                     id,
                     json!({
@@ -127,7 +130,7 @@ mod tests {
     use super::*;
 
     fn send(s: &mut Store, msg: Value) -> Option<Value> {
-        handle_line(s, &msg.to_string())
+        handle_line(s, &Schedule::default(), &msg.to_string())
     }
 
     #[test]
@@ -168,7 +171,10 @@ mod tests {
                 "task_update",
                 "task_finish",
                 "queue_set",
-                "task_closed"
+                "task_closed",
+                "display_off",
+                "display_on",
+                "display_vacation"
             ]
         );
 
@@ -218,7 +224,7 @@ mod tests {
         .unwrap();
         assert_eq!(init["result"]["protocolVersion"], FALLBACK_VERSION);
         assert_eq!(
-            handle_line(&mut s, "{not json").unwrap()["error"]["code"],
+            handle_line(&mut s, &Schedule::default(), "{not json").unwrap()["error"]["code"],
             -32700
         );
         let m = send(

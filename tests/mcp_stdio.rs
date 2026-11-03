@@ -50,7 +50,7 @@ fn mcp_session_over_stdio() {
         json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
     );
     assert_eq!(list["id"], 2);
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 5);
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 8);
 
     let started = ask(
         &mut stdin,

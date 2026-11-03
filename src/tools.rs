@@ -1,10 +1,11 @@
-//! The five tools, shared by the MCP server and `hermes-beaver call`.
+//! The tools, shared by the MCP server and `hermes-beaver call`.
 
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::store::{Store, now};
+use crate::display::{Mode, Request, Schedule, next_change, wants_off};
+use crate::store::{Store, now, read_display, write_display};
 
 const MAX_TITLE: usize = 300;
 const MAX_NOTE: usize = 500;
@@ -144,15 +145,65 @@ pub fn definitions() -> Vec<ToolDef> {
                 "required": ["ref"]
             }),
         },
+        ToolDef {
+            name: "display_off",
+            description: concat!(
+                "Turn the dashboard's monitor off (standby) because the owner is going to sleep or leaving the room. ",
+                "It stays off until display_on, the optional `until` time, or the next scheduled switch on ",
+                "(the dashboard may have a daily schedule, e.g. off at 23:00 and on at 09:00). New tasks don't wake it. ",
+                "The result's `until` says when it comes back on by itself (null: not until display_on). ",
+                "In vacation mode it changes nothing. Takes effect within 10 seconds."
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "until": {"type": "string", "description": "Optional: when to turn the monitor back on by itself, as RFC 3339 (e.g. 2026-11-04T07:00:00+01:00). Without an offset it is the dashboard host's local time."}
+                }
+            }),
+        },
+        ToolDef {
+            name: "display_on",
+            description: concat!(
+                "Turn the dashboard's monitor on because the owner is awake or back. Also ends vacation mode. ",
+                "It stays on until display_off or the next scheduled switch off; the result's `until` says when. ",
+                "Takes effect within 10 seconds."
+            ),
+            input_schema: json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "display_vacation",
+            description: concat!(
+                "Vacation mode: turn the dashboard's monitor off until display_on is called, ignoring the daily schedule. ",
+                "Use it when the owner is away for days (vacation, a trip). Takes effect within 10 seconds."
+            ),
+            input_schema: json!({"type": "object", "properties": {}}),
+        },
     ]
 }
 
-/// Runs one tool. `args` must be a JSON object.
-pub fn call(store: &mut Store, name: &str, args: Value) -> Result<Value, ToolError> {
-    call_at(store, name, args, now())
+/// Runs one tool. `args` must be a JSON object. `schedule` is the monitor's daily
+/// schedule from the config; only the display tools use it.
+pub fn call(
+    store: &mut Store,
+    schedule: &Schedule,
+    name: &str,
+    args: Value,
+) -> Result<Value, ToolError> {
+    call_with(store, schedule, name, args, now())
 }
 
+/// `call` at a given time, without a monitor schedule.
 pub fn call_at(store: &mut Store, name: &str, args: Value, ts: i64) -> Result<Value, ToolError> {
+    call_with(store, &Schedule::default(), name, args, ts)
+}
+
+pub fn call_with(
+    store: &mut Store,
+    schedule: &Schedule,
+    name: &str,
+    args: Value,
+    ts: i64,
+) -> Result<Value, ToolError> {
     let args = if args.is_null() { json!({}) } else { args };
     if !args.is_object() {
         return invalid("arguments must be a JSON object");
@@ -166,6 +217,9 @@ pub fn call_at(store: &mut Store, name: &str, args: Value, ts: i64) -> Result<Va
         "task_finish" => task_finish(&tx, parse(args)?, ts),
         "queue_set" => queue_set(&tx, parse(args)?, ts),
         "task_closed" => task_closed(&tx, parse(args)?, ts),
+        "display_off" => display_off(&tx, schedule, parse(args)?, ts),
+        "display_on" => set_display(&tx, schedule, Mode::On, None, ts),
+        "display_vacation" => set_display(&tx, schedule, Mode::Vacation, None, ts),
         other => Err(ToolError::UnknownTool(other.to_owned())),
     }?;
     tx.commit()?;
@@ -455,6 +509,99 @@ fn task_closed(tx: &Transaction, a: ClosedArgs, ts: i64) -> Result<Value, ToolEr
     Ok(json!({"closed": n}))
 }
 
+#[derive(Deserialize)]
+struct DisplayOffArgs {
+    until: Option<String>,
+}
+
+fn display_off(
+    tx: &Transaction,
+    schedule: &Schedule,
+    a: DisplayOffArgs,
+    ts: i64,
+) -> Result<Value, ToolError> {
+    let until = match a.until.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(s) => {
+            let t = parse_time(s)?;
+            if t <= ts {
+                return invalid(format!("until ({s}) is in the past"));
+            }
+            Some(t)
+        }
+    };
+    let stored = read_display(tx)?;
+    if stored.mode == Mode::Vacation {
+        // Vacation holds until display_on.
+        return Ok(display_reply(&stored, schedule, ts, false));
+    }
+    set_display(tx, schedule, Mode::Off, until, ts)
+}
+
+/// Stores the owner's request (and an event) and describes the result. `changed` says
+/// whether the monitor switches now.
+fn set_display(
+    tx: &Transaction,
+    schedule: &Schedule,
+    mode: Mode,
+    until: Option<i64>,
+    ts: i64,
+) -> Result<Value, ToolError> {
+    let before = wants_off(&read_display(tx)?, schedule, ts);
+    let next = Request {
+        mode,
+        since: ts,
+        until,
+    };
+    write_display(tx, &next)?;
+    let changed = wants_off(&next, schedule, ts) != before;
+    let kind = format!("display_{}", mode.as_str());
+    event(tx, ts, &kind, None, json!({"until": until}))?;
+    Ok(display_reply(&next, schedule, ts, changed))
+}
+
+fn display_reply(req: &Request, schedule: &Schedule, ts: i64, changed: bool) -> Value {
+    let off = wants_off(req, schedule, ts);
+    json!({
+        "display": if off { "off" } else { "on" },
+        "until": next_change(req, schedule, ts).map(local_time),
+        "vacation": req.mode == Mode::Vacation,
+        "changed": changed,
+    })
+}
+
+/// RFC 3339, or a date and time without an offset in the host's local time zone.
+fn parse_time(s: &str) -> Result<i64, ToolError> {
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(t.timestamp());
+    }
+    const LOCAL: &[&str] = &[
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    ];
+    for f in LOCAL {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, f)
+            && let Some(t) = naive.and_local_timezone(chrono::Local).earliest()
+        {
+            return Ok(t.timestamp());
+        }
+    }
+    invalid(format!(
+        "until ({s}) must be a date and time like 2026-11-04T07:00:00+01:00"
+    ))
+}
+
+fn local_time(ts: i64) -> String {
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_else(|| ts.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,7 +627,7 @@ mod tests {
     #[test]
     fn definitions_have_object_schemas() {
         let defs = definitions();
-        assert_eq!(defs.len(), 5);
+        assert_eq!(defs.len(), 8);
         for d in defs {
             assert_eq!(d.input_schema["type"], "object", "{}", d.name);
             assert!(!d.description.is_empty());
@@ -684,6 +831,138 @@ mod tests {
         );
         assert!(err(&mut s, "nope", json!({})).contains("unknown tool"));
         assert!(err(&mut s, "task_start", json!([1, 2])).contains("JSON object"));
+    }
+
+    fn display(s: &Store) -> Request {
+        read_display(&s.conn).unwrap()
+    }
+
+    #[test]
+    fn display_off_and_on_without_a_schedule() {
+        let mut s = store();
+        let r = ok(&mut s, "display_off", json!({}));
+        assert_eq!(
+            r,
+            json!({"display": "off", "until": null, "vacation": false, "changed": true})
+        );
+        assert_eq!(display(&s).mode, Mode::Off);
+        // Repeating it switches nothing.
+        assert_eq!(ok(&mut s, "display_off", json!({}))["changed"], false);
+
+        let r = ok(
+            &mut s,
+            "display_off",
+            json!({"until": "1970-01-01T02:00:00+01:00"}),
+        );
+        assert_eq!(r["changed"], false, "it was already off");
+        assert_eq!(display(&s).until, Some(3600));
+        let shown = chrono::DateTime::parse_from_rfc3339(r["until"].as_str().unwrap()).unwrap();
+        assert_eq!(shown.timestamp(), 3600);
+
+        assert_eq!(
+            ok(&mut s, "display_on", json!({})),
+            json!({"display": "on", "until": null, "vacation": false, "changed": true})
+        );
+        assert_eq!(ok(&mut s, "display_on", json!({}))["changed"], false);
+        assert_eq!(
+            s.event_kinds_since(0).unwrap(),
+            [
+                "display_off",
+                "display_off",
+                "display_off",
+                "display_on",
+                "display_on"
+            ]
+        );
+
+        // Once `until` has passed the monitor is on: display_on switches nothing.
+        ok(
+            &mut s,
+            "display_off",
+            json!({"until": "1970-01-01T02:00:00+01:00"}),
+        );
+        let r = call_at(&mut s, "display_on", json!({}), 5000).unwrap();
+        assert_eq!(r["changed"], false);
+    }
+
+    /// 2030-01-`day` `hh`:00 in the local time zone.
+    fn local(day: u32, hh: u32) -> i64 {
+        chrono::NaiveDate::from_ymd_opt(2030, 1, day)
+            .unwrap()
+            .and_hms_opt(hh, 0, 0)
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .earliest()
+            .unwrap()
+            .timestamp()
+    }
+
+    #[test]
+    fn display_tools_follow_the_schedule_and_vacation() {
+        let mut s = store();
+        let nightly = Schedule {
+            off_at: chrono::NaiveTime::from_hms_opt(23, 0, 0),
+            on_at: chrono::NaiveTime::from_hms_opt(9, 0, 0),
+        };
+        let mut at = |name: &str, args: Value, ts: i64| {
+            call_with(&mut s, &nightly, name, args, ts).unwrap_or_else(|e| panic!("{name}: {e}"))
+        };
+        let until = |r: &Value| {
+            r["until"]
+                .as_str()
+                .map(|u| chrono::DateTime::parse_from_rfc3339(u).unwrap().timestamp())
+        };
+
+        // Awake at night: on, until the next night's switch.
+        let r = at("display_on", json!({}), local(10, 1));
+        assert_eq!(
+            (r["display"].as_str(), r["changed"].as_bool()),
+            (Some("on"), Some(true))
+        );
+        assert_eq!(until(&r), Some(local(10, 23)));
+        // Off in the morning: back on at 09:00.
+        let r = at("display_off", json!({}), local(11, 8));
+        assert_eq!(until(&r), Some(local(11, 9)));
+        // Vacation: off with no end, and display_off doesn't end it.
+        let r = at("display_vacation", json!({}), local(11, 12));
+        assert_eq!(r["vacation"], true);
+        assert_eq!(r["changed"], true);
+        assert_eq!(until(&r), None);
+        let r = at(
+            "display_off",
+            json!({"until": "2030-01-20T10:00:00Z"}),
+            local(12, 12),
+        );
+        assert_eq!(
+            (r["vacation"].as_bool(), r["changed"].as_bool()),
+            (Some(true), Some(false))
+        );
+        assert_eq!(display(&s).mode, Mode::Vacation);
+    }
+
+    #[test]
+    fn display_off_until_validation() {
+        let mut s = store();
+        assert!(
+            err(
+                &mut s,
+                "display_off",
+                json!({"until": "1970-01-01T00:10:00Z"})
+            )
+            .contains("in the past")
+        );
+        assert!(
+            err(&mut s, "display_off", json!({"until": "tomorrow morning"}))
+                .contains("must be a date and time")
+        );
+        // Blank means no end time; a local time without an offset is accepted.
+        assert_eq!(
+            ok(&mut s, "display_off", json!({"until": " "}))["until"],
+            Value::Null
+        );
+        assert!(parse_time("2030-01-02T07:00").is_ok());
+        assert!(parse_time("2030-01-02 07:00:00").is_ok());
+        assert_eq!(parse_time("2030-01-02T07:00:00Z").unwrap(), 1_893_567_600);
     }
 
     #[test]

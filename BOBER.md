@@ -93,13 +93,41 @@ with the owner (Telegram, CLI, web UI):
   task_finish: the gate scripts do that.
 - Never put secrets in titles, notes or summaries; the dashboard is on a wall.
 - If a dashboard call fails, ignore it and carry on.
+- The dashboard's monitor: when the owner says they are going to sleep or leaving
+  the room, call `mcp__beaver__display_off`; if they say when they'll be back, pass
+  that time as `until` (RFC 3339 with their UTC offset). When they leave for days
+  (vacation, a trip), call `mcp__beaver__display_vacation`. When they are up or back,
+  call `mcp__beaver__display_on`. Confirm with the result's `until` (when it switches
+  back by itself). These aren't tasks: no task_start for them.
 ```
 
 Open Telegram sessions keep their old system prompt. The owner needs to send `/new` once.
 
-## 8. Check
+## 8. Quick commands `/sleep`, `/awake` and `/vacation`
+
+Add these to `~/.hermes/config.yaml` under `quick_commands`, creating the key if it doesn't exist. They switch the monitor without a model call, so they work even when the model provider is down. Each replies with one line, e.g. `Screen off until tomorrow 09:00.` The gateway reads them on every message, so no restart is needed.
+
+```yaml
+quick_commands:
+  sleep:
+    type: exec
+    command: /home/bartosz/.local/bin/hermes-beaver display off
+  awake:
+    type: exec
+    command: /home/bartosz/.local/bin/hermes-beaver display on
+  vacation:
+    type: exec
+    command: /home/bartosz/.local/bin/hermes-beaver display vacation
+```
+
+Don't name any of them `wake`: `/wake` is a built-in command (the wake-word listener), and built-ins take precedence.
+
+The dashboard also switches the monitor on its own daily schedule (`[display]` in its config); that needs nothing from Hermes.
+
+## 9. Check
 
 1. Run `~/.local/bin/hermes-beaver call queue_set '{"items":[]}'`. It should print `{"changed":…,"count":0}`.
 2. After the next gate tick (≤ 6 minutes), the dashboard's queue matches the pending jobs.
 3. When a job is dispatched, it moves from queued to working. After `--mark done` it appears under "Recently finished", and under "Needs you" as ready for review. Closing the issue removes it.
 4. A Telegram request that needs tools shows up as a `TG` task and finishes.
+5. `/sleep` in Telegram answers `Screen off until …` and turns the monitor off within 10 seconds. `/awake` turns it back on. `/vacation` answers `Vacation mode: …`; then `/awake` ends it.

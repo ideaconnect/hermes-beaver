@@ -3,7 +3,7 @@
 use anyhow::Result;
 use rusqlite::{Row, params};
 
-use super::Store;
+use super::{Store, read_display};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskRow {
@@ -56,6 +56,8 @@ pub struct Snapshot {
     pub done_count: i64,
     pub go_live_at: i64,
     pub last_event_id: i64,
+    /// The owner's last monitor request.
+    pub display: crate::display::Request,
 }
 
 const COLS: &str = "id, source, kind, title, ref, url, pr_url, cron_job_id, status, note, summary,
@@ -212,6 +214,7 @@ impl Store {
             done_count: self.done_count()?,
             go_live_at: self.go_live_at()?,
             last_event_id: self.last_event_id()?,
+            display: read_display(&self.conn)?,
         })
     }
 }

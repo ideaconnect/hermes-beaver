@@ -16,9 +16,12 @@ step() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 as_user() { runuser -u "$USER_NAME" -- env XDG_RUNTIME_DIR="$RUNTIME" DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNTIME/bus" "$@"; }
 user_install() { install -D -o "$USER_NAME" -g "$USER_NAME" "$@"; }
 
-step "System packages: ddcutil (monitor brightness over DDC/CI)"
-if command -v ddcutil >/dev/null; then echo "already installed"
-else DEBIAN_FRONTEND=noninteractive apt-get install -y -q ddcutil; fi
+step "System packages: ddcutil (brightness over DDC/CI), xset (monitor standby)"
+PKGS=()
+command -v ddcutil >/dev/null || PKGS+=(ddcutil)
+command -v xset >/dev/null || PKGS+=(x11-xserver-utils)
+if [ ${#PKGS[@]} -eq 0 ]; then echo "already installed"
+else DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${PKGS[@]}"; fi
 
 step "i2c access for $USER_NAME"
 groupadd -f i2c
@@ -68,5 +71,6 @@ else echo "no user session: the dashboard starts at the next login"; fi
 
 step "Restart a running MCP server so Hermes respawns it on the new binary"
 if pkill -u "$USER_NAME" -f 'hermes-beaver mcp'; then echo "stopped the old MCP server"; else echo "none running"; fi
+echo "Hermes respawns it on the next call. If this release added tools, send /reload-mcp to Hermes so the model sees them."
 
 step "Done"

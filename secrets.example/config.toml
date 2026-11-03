@@ -1,6 +1,12 @@
 # Copy to secrets/config.toml and fill in. `make deploy` installs it as
 # ~/.config/hermes-beaver/config.toml on the host. Every key is optional.
 
+timezone = "Europe/Warsaw"   # IANA zone for the clock and the schedule; unset = the host's
+
 [hermes]
 home = "/home/<user>/.hermes"
 agent_jobs = ["<cron job id>", "<cron job id>"]   # jobs whose failures raise the health banner
+
+[display]
+off_at = "23:00"   # daily monitor standby; leave both out for no schedule
+on_at = "09:00"
