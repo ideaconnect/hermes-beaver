@@ -1,0 +1,13 @@
+[Unit]
+Description=hermes-beaver dashboard for Hermes Agent
+Documentation=https://github.com/ideaconnect/hermes-beaver
+# Started by the XFCE autostart entry, which first imports DISPLAY/XAUTHORITY
+# into the user manager (see hermes-beaver-autostart.desktop).
+
+[Service]
+ExecStart=%h/.local/bin/hermes-beaver
+Restart=on-failure
+RestartSec=5
+# SIGTERM ends the event loop cleanly so the monitor brightness is restored.
+KillSignal=SIGTERM
+TimeoutStopSec=15

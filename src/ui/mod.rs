@@ -1,0 +1,386 @@
+//! The Slint app shell and the 10-second refresh loop.
+
+mod demo;
+mod view;
+
+use std::cell::RefCell;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::{Duration, SystemTime};
+
+use anyhow::{Context, Result};
+use slint::{ComponentHandle, ModelRc, Rgba8Pixel, SharedPixelBuffer, Timer, TimerMode, VecModel};
+
+use crate::brightness::{self, Controller, Levels};
+use crate::config::{Config, Renderer};
+use crate::health::{self, Health};
+use crate::hermes::HermesReader;
+use crate::metrics::{self, Metrics, Source};
+use crate::reconcile;
+use crate::store::views::Snapshot;
+use crate::store::{self, Store};
+
+slint::include_modules!();
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mode {
+    Live,
+    /// `None` cycles through every scenario.
+    Demo(Option<String>),
+}
+
+/// Events that brighten the screen.
+const WAKE_EVENTS: &[&str] = &[
+    "task_started",
+    "task_finished",
+    "feedback_needed",
+    "queue_changed",
+];
+
+const TICK: Duration = Duration::from_secs(10);
+
+struct App {
+    config: Config,
+    store: Option<Store>,
+    store_path: PathBuf,
+    store_error: Option<String>,
+    db_stamp: Option<(Option<SystemTime>, Option<SystemTime>)>,
+    hermes: Option<HermesReader>,
+    demo: Option<demo::Demo>,
+    source: Box<dyn Source>,
+    metrics: Metrics,
+    gpu_shown: bool,
+    snapshot: Snapshot,
+    health: Option<Health>,
+    last_event_id: Option<i64>,
+    brightness: Option<Controller>,
+}
+
+pub fn run(
+    config: &Config,
+    mode: Mode,
+    store_path: &Path,
+    screenshot: Option<&Path>,
+    windowed: bool,
+) -> Result<()> {
+    select_backend(config.ui.renderer);
+
+    let mut app = App::new(config.clone(), &mode, store_path)?;
+    let window = MainWindow::new().context("creating the main window")?;
+    let host = hostname();
+    window.set_hostname(match mode {
+        Mode::Live => host.into(),
+        Mode::Demo(_) => format!("{host} · demo").into(),
+    });
+    window.set_clock(clock_text().into());
+    window.window().set_fullscreen(!windowed);
+
+    window.on_quit(|| {
+        let _ = slint::quit_event_loop();
+    });
+    let weak = window.as_weak();
+    window.on_toggle_fullscreen(move || {
+        if let Some(w) = weak.upgrade() {
+            let fs = w.window().is_fullscreen();
+            w.window().set_fullscreen(!fs);
+        }
+    });
+
+    app.refresh(store::now());
+    app.render(&window, store::now());
+    let app = Rc::new(RefCell::new(app));
+
+    // Clock: check every second, touch the property (and redraw) only when it changes.
+    let clock_timer = Timer::default();
+    let weak = window.as_weak();
+    clock_timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
+        if let Some(w) = weak.upgrade() {
+            let now = clock_text();
+            if w.get_clock() != now.as_str() {
+                w.set_clock(now.into());
+            }
+        }
+    });
+
+    // First metrics shortly after start, then every 10 s.
+    let tick = {
+        let app = app.clone();
+        let weak = window.as_weak();
+        move || {
+            if let Some(w) = weak.upgrade() {
+                let mut a = app.borrow_mut();
+                a.sample_metrics();
+                let wake = a.refresh(store::now());
+                a.render(&w, store::now());
+                if wake && let Some(b) = &a.brightness {
+                    b.wake();
+                }
+            }
+        }
+    };
+    let first_timer = Timer::default();
+    first_timer.start(TimerMode::SingleShot, Duration::from_secs(2), tick.clone());
+    let tick_timer = Timer::default();
+    tick_timer.start(TimerMode::Repeated, TICK, tick);
+
+    let shot_timer = Timer::default();
+    if let Some(path) = screenshot.map(Path::to_path_buf) {
+        let weak = window.as_weak();
+        shot_timer.start(
+            TimerMode::SingleShot,
+            Duration::from_millis(1500),
+            move || {
+                if let Some(w) = weak.upgrade() {
+                    match w.window().take_snapshot() {
+                        Ok(buf) => match write_ppm(&path, &buf) {
+                            Ok(()) => {
+                                eprintln!("hermes-beaver: snapshot saved to {}", path.display())
+                            }
+                            Err(e) => eprintln!("hermes-beaver: writing snapshot failed: {e}"),
+                        },
+                        Err(e) => eprintln!("hermes-beaver: snapshot failed: {e}"),
+                    }
+                }
+                let _ = slint::quit_event_loop();
+            },
+        );
+    }
+
+    watch_signals();
+    window.run().context("running the event loop")?;
+    // Dropping the app restores brightness (and removes the demo store).
+    drop(app);
+    Ok(())
+}
+
+impl App {
+    fn new(config: Config, mode: &Mode, store_path: &Path) -> Result<Self> {
+        let base = |store, store_error, source: Box<dyn Source>, metrics, gpu_shown| Self {
+            config: config.clone(),
+            store,
+            store_path: store_path.to_path_buf(),
+            store_error,
+            db_stamp: None,
+            hermes: None,
+            demo: None,
+            source,
+            metrics,
+            gpu_shown,
+            snapshot: Snapshot::default(),
+            health: None,
+            last_event_id: None,
+            brightness: None,
+        };
+        Ok(match mode {
+            Mode::Live => {
+                let (store, err) = match Store::open(store_path) {
+                    Ok(s) => (Some(s), None),
+                    Err(e) => (None, Some(format!("cannot open the event store: {e:#}"))),
+                };
+                let source = metrics::SystemSource::new(&config.metrics.disk);
+                let mut app = base(
+                    store,
+                    err,
+                    Box::new(source),
+                    Metrics::default(),
+                    metrics::gpu::available(),
+                );
+                app.hermes = Some(HermesReader::new(
+                    config.hermes_home(),
+                    config.hermes.agent_jobs.clone(),
+                ));
+                let method = config.brightness.method;
+                app.brightness = Some(Controller::start(
+                    Levels::from(&config.brightness),
+                    move || brightness::select(method),
+                ));
+                app
+            }
+            Mode::Demo(scenario) => {
+                let fixed = scenario.as_deref().map(demo::Scenario::parse).transpose()?;
+                let (demo, store) = demo::Demo::new(fixed)?;
+                let mut source = demo::DemoSource::new();
+                let mut m = Metrics::default();
+                demo::prefill(&mut m, &mut source);
+                let mut app = base(Some(store), None, Box::new(source), m, true);
+                app.demo = Some(demo);
+                app
+            }
+        })
+    }
+
+    fn sample_metrics(&mut self) {
+        let s = self.source.sample();
+        self.metrics.record(s);
+    }
+
+    /// Re-reads health and (if it changed) the store. Returns whether to wake the screen.
+    fn refresh(&mut self, now: i64) -> bool {
+        let mut force_reload = false;
+
+        // Health (and reconciliation, which needs the same ledger).
+        let mut health = if let Some(demo) = &mut self.demo {
+            if let Some(store) = &mut self.store {
+                match demo.advance(store) {
+                    Ok(true) => force_reload = true,
+                    Ok(false) => {}
+                    Err(e) => eprintln!("hermes-beaver: demo: {e:#}"),
+                }
+            }
+            demo.health()
+        } else if let Some(hermes) = &mut self.hermes {
+            let st = hermes.poll();
+            if let Some(store) = &mut self.store {
+                match reconcile::reconcile(store, &st.executions, now) {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        eprintln!("hermes-beaver: reconciled {n} task(s) from the cron ledger");
+                        force_reload = true;
+                    }
+                    Err(e) => eprintln!("hermes-beaver: reconcile: {e:#}"),
+                }
+            }
+            health::evaluate(
+                &st,
+                Duration::from_secs(self.config.hermes.heartbeat_max_age_secs),
+                !self.config.hermes.agent_jobs.is_empty(),
+            )
+        } else {
+            Health::default()
+        };
+        if let Some(e) = &self.store_error {
+            health.problems.push(e.clone());
+        }
+        let mut wake = matches!(&self.health, Some(old) if *old != health);
+        self.health = Some(health);
+
+        // Store: re-query only when another process (or we) wrote to it.
+        let Some(store) = &self.store else {
+            return wake;
+        };
+        let stamp = db_stamp(&self.store_path);
+        if force_reload || self.demo.is_some() || self.db_stamp != Some(stamp) {
+            match store.snapshot(self.config.tasks.finished_rows) {
+                Ok(snap) => {
+                    self.snapshot = snap;
+                    self.db_stamp = Some(stamp);
+                }
+                Err(e) => eprintln!("hermes-beaver: reading the store: {e:#}"),
+            }
+        }
+        let latest = self.snapshot.last_event_id;
+        if let Some(seen) = self.last_event_id
+            && latest > seen
+        {
+            match store.event_kinds_since(seen) {
+                Ok(kinds) => wake |= kinds.iter().any(|k| WAKE_EVENTS.contains(&k.as_str())),
+                Err(e) => eprintln!("hermes-beaver: reading events: {e:#}"),
+            }
+        }
+        self.last_event_id = Some(latest);
+        wake
+    }
+
+    fn render(&self, w: &MainWindow, now: i64) {
+        let snap = &self.snapshot;
+        let health = self.health.clone().unwrap_or_default();
+        let stale = self.config.tasks.stale_after_mins as i64 * 60;
+
+        let (tasks, tasks_hint) = view::task_items(snap, now, stale);
+        let (needs, needs_hint) = view::need_items(snap, now);
+        let done_rows = view::done_rows(
+            needs.len(),
+            !needs_hint.is_empty(),
+            self.config.tasks.finished_rows,
+        );
+        let (done, done_hint) = view::done_items(snap, now, done_rows);
+        let mood = view::mood(&health, snap);
+        let (caption, tone) = view::beaver_caption(mood, snap);
+
+        w.set_banner(health.banner().into());
+        w.set_tasks(model(tasks));
+        w.set_tasks_hint(tasks_hint.into());
+        w.set_needs(model(needs));
+        w.set_needs_hint(needs_hint.into());
+        w.set_done(model(done));
+        w.set_done_hint(done_hint.into());
+        w.set_metrics(model(view::metric_items(
+            &self.metrics,
+            self.gpu_shown,
+            view::loadavg(),
+        )));
+        w.set_beaver_art(view::beaver_art(mood).into());
+        w.set_beaver_caption(caption.into());
+        w.set_beaver_tone(tone);
+        w.set_counter(snap.done_count.to_string().into());
+        w.set_counter_label(view::counter_label(snap.go_live_at).into());
+    }
+}
+
+fn model<T: Clone + 'static>(v: Vec<T>) -> ModelRc<T> {
+    ModelRc::from(Rc::new(VecModel::from(v)))
+}
+
+fn db_stamp(db: &Path) -> (Option<SystemTime>, Option<SystemTime>) {
+    let m = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut wal = db.as_os_str().to_owned();
+    wal.push("-wal");
+    (m(db), m(Path::new(&wal)))
+}
+
+/// SIGTERM/SIGINT/SIGHUP end the event loop cleanly, so brightness is restored.
+fn watch_signals() {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGHUP]) else {
+        return;
+    };
+    std::thread::Builder::new()
+        .name("signals".into())
+        .spawn(move || {
+            if signals.forever().next().is_some() {
+                let _ = slint::invoke_from_event_loop(|| {
+                    let _ = slint::quit_event_loop();
+                });
+            }
+        })
+        .ok();
+}
+
+/// Renderer from the config; `SLINT_BACKEND` in the environment overrides it.
+fn select_backend(renderer: Renderer) {
+    if std::env::var_os("SLINT_BACKEND").is_some() {
+        return;
+    }
+    let name = match renderer {
+        Renderer::Software => "software",
+        Renderer::Opengl => "femtovg",
+    };
+    let chosen = slint::BackendSelector::new()
+        .backend_name("winit".into())
+        .renderer_name(name.into())
+        .select();
+    if let Err(e) = chosen {
+        eprintln!("hermes-beaver: renderer `{name}` unavailable ({e}); using the default");
+    }
+}
+
+fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_else(|_| "hermes".into())
+}
+
+fn clock_text() -> String {
+    chrono::Local::now().format("%H:%M").to_string()
+}
+
+/// Writes an RGBA buffer as binary PPM (alpha dropped). No image crate needed.
+fn write_ppm(path: &Path, buf: &SharedPixelBuffer<Rgba8Pixel>) -> std::io::Result<()> {
+    let mut out = Vec::with_capacity(32 + buf.as_slice().len() * 3);
+    write!(out, "P6\n{} {}\n255\n", buf.width(), buf.height())?;
+    for p in buf.as_slice() {
+        out.extend_from_slice(&[p.r, p.g, p.b]);
+    }
+    std::fs::write(path, out)
+}

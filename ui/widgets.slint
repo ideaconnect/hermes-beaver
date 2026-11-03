@@ -1,0 +1,297 @@
+import { Theme, Tone } from "theme.slint";
+
+export struct TaskItem {
+    badge: string,
+    title: string,
+    meta: string,
+    status: string,
+    tone: int,
+}
+
+export struct NeedItem {
+    label: string,
+    title: string,
+    detail: string,
+    age: string,
+    tone: int,
+}
+
+export struct DoneItem {
+    badge: string,
+    title: string,
+    outcome: string,
+    age: string,
+    tone: int,
+}
+
+export struct MetricItem {
+    label: string,
+    value: float,
+    text: string,
+    detail: string,
+    spark: string,
+    shown: bool,
+}
+
+// A titled block of the dashboard. Content that doesn't fit is clipped.
+export component Panel inherits Rectangle {
+    in property <string> title;
+    background: Theme.panel;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border;
+    clip: true;
+
+    VerticalLayout {
+        padding: Theme.pad;
+        spacing: 14px;
+        alignment: start;
+        Text {
+            text: root.title;
+            color: Theme.text-dim;
+            font-size: Theme.font-title;
+            font-weight: 700;
+            letter-spacing: 3px;
+        }
+
+        @children
+    }
+}
+
+// Small heading inside a panel.
+export component SubHeading inherits Text {
+    color: Theme.text-dim;
+    font-size: Theme.font-title;
+    font-weight: 700;
+    letter-spacing: 3px;
+}
+
+// Horizontal gauge, 0..1.
+export component Bar inherits Rectangle {
+    in property <float> value;
+    in property <color> fill: Theme.accent;
+    height: 16px;
+    border-radius: self.height / 2;
+    background: Theme.track;
+    Rectangle {
+        x: 0;
+        width: parent.width * clamp(root.value, 0, 1);
+        border-radius: parent.border-radius;
+        background: root.fill;
+    }
+}
+
+// Source badge: GH / TG / CLI.
+export component Badge inherits Rectangle {
+    in property <string> text;
+    width: 58px;
+    height: 30px;
+    border-radius: 6px;
+    background: Tone.badge(root.text);
+    Text {
+        text: root.text;
+        color: white;
+        font-size: 17px;
+        font-weight: 800;
+    }
+}
+
+export component Sparkline inherits Rectangle {
+    in property <string> commands;
+    height: 34px;
+    Path {
+        width: parent.width;
+        height: parent.height;
+        viewbox-width: 1000;
+        viewbox-height: 100;
+        commands: root.commands == "" ? "M 0 100 L 1000 100" : root.commands;
+        stroke: Theme.accent.transparentize(35%);
+        stroke-width: 2px;
+    }
+}
+
+export component MetricRow inherits VerticalLayout {
+    in property <MetricItem> item;
+    spacing: 4px;
+    HorizontalLayout {
+        spacing: 16px;
+        Text {
+            text: root.item.label;
+            width: 86px;
+            color: Theme.text;
+            font-size: Theme.font-body;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+
+        VerticalLayout {
+            alignment: center;
+            Bar {
+                value: root.item.value;
+                fill: root.item.value > 0.9 ? Theme.danger : root.item.value > 0.75 ? Theme.warn : Theme.accent;
+            }
+        }
+
+        Text {
+            text: root.item.text;
+            width: 96px;
+            horizontal-alignment: right;
+            color: Theme.text;
+            font-size: Theme.font-body;
+            font-weight: 700;
+        }
+    }
+
+    HorizontalLayout {
+        spacing: 16px;
+        Rectangle {
+            width: 86px;
+        }
+
+        Sparkline {
+            horizontal-stretch: 1;
+            commands: root.item.spark;
+        }
+
+        Text {
+            text: root.item.detail;
+            width: 230px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+            color: Theme.text-dim;
+            font-size: Theme.font-small;
+        }
+    }
+}
+
+export component TaskRow inherits HorizontalLayout {
+    in property <TaskItem> item;
+    spacing: 14px;
+    VerticalLayout {
+        alignment: start;
+        padding-top: 4px;
+        Badge {
+            text: root.item.badge;
+        }
+    }
+
+    VerticalLayout {
+        horizontal-stretch: 1;
+        spacing: 2px;
+        Text {
+            text: root.item.title;
+            color: root.item.tone == 5 ? Theme.text-dim : Theme.text;
+            font-size: Theme.font-body;
+            overflow: elide;
+        }
+
+        Text {
+            text: root.item.meta;
+            color: Theme.text-dim;
+            font-size: Theme.font-small;
+            overflow: elide;
+        }
+    }
+
+    Text {
+        text: root.item.status;
+        min-width: 190px;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        color: Tone.color(root.item.tone);
+        font-size: Theme.font-small;
+        font-weight: 700;
+    }
+}
+
+export component NeedRow inherits HorizontalLayout {
+    in property <NeedItem> item;
+    spacing: 14px;
+    Rectangle {
+        width: 8px;
+        border-radius: 4px;
+        background: Tone.color(root.item.tone);
+    }
+
+    VerticalLayout {
+        horizontal-stretch: 1;
+        spacing: 2px;
+        HorizontalLayout {
+            spacing: 12px;
+            Text {
+                text: root.item.label;
+                color: Tone.color(root.item.tone);
+                font-size: Theme.font-small;
+                font-weight: 800;
+                vertical-alignment: center;
+            }
+
+            Text {
+                horizontal-stretch: 1;
+                text: root.item.title;
+                color: Theme.text;
+                font-size: Theme.font-body;
+                overflow: elide;
+            }
+        }
+
+        Text {
+            text: root.item.detail;
+            color: Theme.text-dim;
+            font-size: Theme.font-small;
+            overflow: elide;
+        }
+    }
+
+    Text {
+        text: root.item.age;
+        min-width: 90px;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        color: Theme.text-dim;
+        font-size: Theme.font-small;
+    }
+}
+
+export component DoneRow inherits HorizontalLayout {
+    in property <DoneItem> item;
+    spacing: 14px;
+    Badge {
+        text: root.item.badge;
+    }
+
+    Text {
+        horizontal-stretch: 1;
+        text: root.item.title;
+        color: Theme.text;
+        font-size: Theme.font-small;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    Text {
+        text: root.item.outcome;
+        min-width: 150px;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        color: Tone.color(root.item.tone);
+        font-size: Theme.font-small;
+        font-weight: 700;
+    }
+
+    Text {
+        text: root.item.age;
+        min-width: 90px;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        color: Theme.text-dim;
+        font-size: Theme.font-small;
+    }
+}
+
+// "+N more" / empty-state line.
+export component Hint inherits Text {
+    color: Theme.text-dim;
+    font-size: Theme.font-small;
+    font-italic: true;
+}

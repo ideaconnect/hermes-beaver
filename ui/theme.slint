@@ -1,0 +1,35 @@
+// Design tokens. Sizes assume a 1920x1080 logical screen viewed from a few metres.
+export global Theme {
+    out property <color> bg: #0e1014;
+    out property <color> panel: #161920;
+    out property <color> border: #252a35;
+    out property <color> text: #e8eaf0;
+    out property <color> text-dim: #8b92a5;
+    out property <color> accent: #e8a052;
+    out property <color> ok: #4cc38a;
+    out property <color> warn: #e5b84a;
+    out property <color> danger: #e5534b;
+    out property <color> track: #232733;
+
+    out property <length> gap: 16px;
+    out property <length> pad: 22px;
+    out property <length> radius: 12px;
+
+    out property <length> font-header: 30px;
+    out property <length> font-title: 20px;
+    out property <length> font-body: 26px;
+    out property <length> font-small: 21px;
+    out property <length> font-mono: 22px;
+    out property <string> mono: "DejaVu Sans Mono";
+}
+
+// Semantic colours. Tones: 0 normal, 1 working, 2 attention, 3 danger, 4 ok, 5 dim.
+export global Tone {
+    public pure function color(t: int) -> color {
+        return t == 1 ? Theme.accent : t == 2 ? Theme.warn : t == 3 ? Theme.danger : t == 4 ? Theme.ok : t == 5 ? Theme.text-dim : Theme.text;
+    }
+
+    public pure function badge(b: string) -> color {
+        return b == "GH" ? #8957e5 : b == "TG" ? #1f8fd1 : #4b5263;
+    }
+}
