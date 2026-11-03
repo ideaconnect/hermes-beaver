@@ -1,0 +1,6 @@
+# Copy to secrets/config.toml and fill in. `make deploy` installs it as
+# ~/.config/hermes-beaver/config.toml on the host. Every key is optional.
+
+[hermes]
+home = "/home/<user>/.hermes"
+agent_jobs = ["<cron job id>", "<cron job id>"]   # jobs whose failures raise the health banner

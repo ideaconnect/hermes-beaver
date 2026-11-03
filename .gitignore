@@ -1,0 +1,12 @@
+# Host-specific values and credentials: never committed (template in secrets.example/)
+/secrets/
+
+# Rust
+/target/
+
+# Local stores and editor noise
+*.db
+*.db-wal
+*.db-shm
+.vscode/
+.idea/
