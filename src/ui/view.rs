@@ -5,6 +5,7 @@ use chrono::TimeZone;
 use slint::SharedString;
 
 use super::{DoneItem, MetricItem, NeedItem, TaskItem};
+use crate::config::{Animal, UiConfig};
 use crate::health::Health;
 use crate::mask::mask;
 use crate::metrics::Metrics;
@@ -387,21 +388,48 @@ pub fn mood(health: &Health, snap: &Snapshot) -> Mood {
     }
 }
 
-pub fn beaver_art(m: Mood) -> &'static str {
-    match m {
-        Mood::Working => include_str!("../../ui/beaver/working.txt"),
-        Mood::Idle => include_str!("../../ui/beaver/idle.txt"),
-        Mood::NeedsYou => include_str!("../../ui/beaver/needs.txt"),
-        Mood::Broken => include_str!("../../ui/beaver/broken.txt"),
+pub fn mascot_art(a: Animal, m: Mood) -> &'static str {
+    match (a, m) {
+        (Animal::Beaver, Mood::Working) => include_str!("../../ui/art/beaver/working.txt"),
+        (Animal::Beaver, Mood::Idle) => include_str!("../../ui/art/beaver/idle.txt"),
+        (Animal::Beaver, Mood::NeedsYou) => include_str!("../../ui/art/beaver/needs.txt"),
+        (Animal::Beaver, Mood::Broken) => include_str!("../../ui/art/beaver/broken.txt"),
+        (Animal::Squirrel, Mood::Working) => include_str!("../../ui/art/squirrel/working.txt"),
+        (Animal::Squirrel, Mood::Idle) => include_str!("../../ui/art/squirrel/idle.txt"),
+        (Animal::Squirrel, Mood::NeedsYou) => include_str!("../../ui/art/squirrel/needs.txt"),
+        (Animal::Squirrel, Mood::Broken) => include_str!("../../ui/art/squirrel/broken.txt"),
     }
     .trim_end_matches('\n')
+}
+
+/// Font size of an animal's frames, in px. Larger art gets a smaller font, so that
+/// every animal leaves the same room for the caption and the counter.
+pub fn mascot_font_px(a: Animal) -> f32 {
+    match a {
+        Animal::Beaver => 22.0,
+        Animal::Squirrel => 14.0,
+    }
+}
+
+/// The animal panel's title: `animal_name` if set, else the animal's own name.
+pub fn mascot_title(ui: &UiConfig) -> String {
+    let default = match ui.animal {
+        Animal::Beaver => "Beaver",
+        Animal::Squirrel => "Squirrel",
+    };
+    ui.animal_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(default)
+        .to_uppercase()
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-pub fn beaver_caption(m: Mood, snap: &Snapshot) -> (String, i32) {
+pub fn mascot_caption(m: Mood, snap: &Snapshot) -> (String, i32) {
     let reviews = snap
         .needs
         .iter()
@@ -635,15 +663,43 @@ mod tests {
         });
         assert_eq!(mood(&ok, &snap), Mood::NeedsYou);
         assert_eq!(mood(&broken, &snap), Mood::Broken);
-        assert_eq!(beaver_caption(Mood::NeedsYou, &snap).0, "1 thing needs you");
+        assert_eq!(mascot_caption(Mood::NeedsYou, &snap).0, "1 thing needs you");
     }
 
     #[test]
-    fn beaver_frames_are_present() {
-        for m in [Mood::Working, Mood::Idle, Mood::NeedsYou, Mood::Broken] {
-            let art = beaver_art(m);
-            assert!(art.lines().count() >= 8, "{m:?}");
-            assert!(art.lines().all(|l| l.chars().count() <= 40), "{m:?}");
+    fn mascot_frames_fit_the_panel() {
+        // DejaVu Sans Mono's advance and line height, in em.
+        const ADVANCE: f32 = 0.602;
+        const LINE: f32 = 1.164;
+        // The panel is about 705x400 px inside; the counter needs the rest of the width.
+        const MAX_WIDTH: f32 = 480.0;
+        const MAX_HEIGHT: f32 = 400.0;
+        let moods = [Mood::Working, Mood::Idle, Mood::NeedsYou, Mood::Broken];
+        for a in [Animal::Beaver, Animal::Squirrel] {
+            let px = mascot_font_px(a);
+            for m in moods {
+                let art = mascot_art(a, m);
+                let cols = art.lines().map(|l| l.chars().count()).max().unwrap();
+                let rows = art.lines().count();
+                assert!(rows >= 8, "{a:?} {m:?}");
+                assert!(cols as f32 * ADVANCE * px <= MAX_WIDTH, "{a:?} {m:?}");
+                assert!(rows as f32 * LINE * px <= MAX_HEIGHT, "{a:?} {m:?}");
+            }
+            let distinct: std::collections::HashSet<_> =
+                moods.iter().map(|m| mascot_art(a, *m)).collect();
+            assert_eq!(distinct.len(), moods.len(), "{a:?}");
         }
+    }
+
+    #[test]
+    fn mascot_title_is_the_name_or_the_animal() {
+        let mut ui = UiConfig::default();
+        assert_eq!(mascot_title(&ui), "BEAVER");
+        ui.animal = Animal::Squirrel;
+        assert_eq!(mascot_title(&ui), "SQUIRREL");
+        ui.animal_name = Some("Suseł".into());
+        assert_eq!(mascot_title(&ui), "SUSEŁ");
+        ui.animal_name = Some("  ".into());
+        assert_eq!(mascot_title(&ui), "SQUIRREL");
     }
 }

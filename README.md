@@ -5,7 +5,7 @@ A lightweight, full-screen dashboard that runs next to [Hermes Agent](https://gi
 - current tasks and the queue (GitHub, Telegram, direct);
 - what needs your feedback, and recently finished work;
 - CPU, memory, disk and GPU load, with 30-minute sparklines;
-- an ASCII beaver whose mood follows the agent (working, napping, needs you, broken);
+- an ASCII animal, a beaver or a ground squirrel, whose mood follows the agent (working, napping, needs you, broken);
 - a red banner when Hermes itself is unhealthy;
 - a clock with ticking seconds, so you can tell at a glance that the screen isn't frozen.
 
@@ -85,4 +85,6 @@ on_at = "09:00"              # leave it out to stay off until turned on
 
 [ui]
 renderer = "software"        # software (~24 MB) | opengl (~95 MB); SLINT_BACKEND overrides
+animal = "beaver"            # the ASCII animal: beaver | squirrel
+animal_name = "Beaver"       # its panel's title (shown in capitals); default: the animal's name
 ```

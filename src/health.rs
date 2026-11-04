@@ -1,4 +1,4 @@
-//! Health rules: decide whether the red banner (and the broken beaver) is on.
+//! Health rules: decide whether the red banner (and the broken animal) is on.
 //!
 //! These read Hermes directly because a broken agent can't report its own
 //! breakage over MCP: a run that fails before the model starts never calls a tool.

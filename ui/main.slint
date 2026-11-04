@@ -16,9 +16,11 @@ component MainScreen inherits VerticalLayout {
     in property <[DoneItem]> done;
     in property <string> done-hint;
     in property <[MetricItem]> metrics;
-    in property <string> beaver-art;
-    in property <string> beaver-caption;
-    in property <int> beaver-tone;
+    in property <string> mascot-title;
+    in property <length> mascot-font-size: 22px;
+    in property <string> mascot-art;
+    in property <string> mascot-caption;
+    in property <int> mascot-tone;
     in property <string> counter;
     in property <string> counter-label;
 
@@ -149,14 +151,14 @@ component MainScreen inherits VerticalLayout {
             y: grid.row-h + Theme.gap;
             width: grid.right-w;
             height: grid.row-h;
-            title: "BEAVER";
+            title: root.mascot-title;
             HorizontalLayout {
                 spacing: 24px;
                 Text {
-                    text: root.beaver-art;
+                    text: root.mascot-art;
                     font-family: Theme.mono;
-                    font-size: Theme.font-mono;
-                    color: Tone.color(root.beaver-tone);
+                    font-size: root.mascot-font-size;
+                    color: Tone.color(root.mascot-tone);
                     wrap: no-wrap;
                     vertical-alignment: center;
                 }
@@ -166,8 +168,8 @@ component MainScreen inherits VerticalLayout {
                     alignment: center;
                     spacing: 6px;
                     Text {
-                        text: root.beaver-caption;
-                        color: Tone.color(root.beaver-tone);
+                        text: root.mascot-caption;
+                        color: Tone.color(root.mascot-tone);
                         font-size: Theme.font-body;
                         font-weight: 700;
                         wrap: word-wrap;
@@ -208,9 +210,11 @@ export component MainWindow inherits Window {
     in property <[DoneItem]> done;
     in property <string> done-hint;
     in property <[MetricItem]> metrics;
-    in property <string> beaver-art;
-    in property <string> beaver-caption;
-    in property <int> beaver-tone;
+    in property <string> mascot-title;
+    in property <length> mascot-font-size: 22px;
+    in property <string> mascot-art;
+    in property <string> mascot-caption;
+    in property <int> mascot-tone;
     in property <string> counter: "0";
     in property <string> counter-label;
     callback quit();
@@ -248,9 +252,11 @@ export component MainWindow inherits Window {
             done: root.done;
             done-hint: root.done-hint;
             metrics: root.metrics;
-            beaver-art: root.beaver-art;
-            beaver-caption: root.beaver-caption;
-            beaver-tone: root.beaver-tone;
+            mascot-title: root.mascot-title;
+            mascot-font-size: root.mascot-font-size;
+            mascot-art: root.mascot-art;
+            mascot-caption: root.mascot-caption;
+            mascot-tone: root.mascot-tone;
             counter: root.counter;
             counter-label: root.counter-label;
         }

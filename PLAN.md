@@ -2,7 +2,7 @@
 
 A lightweight, full-screen dashboard that runs next to Hermes Agent and shows what it is doing.
 It shows the current tasks and queue, what needs the owner's feedback, recently finished work,
-system load, and an ASCII beaver whose mood follows the agent's state.
+system load, and an ASCII animal (`ui.animal`: beaver or ground squirrel) whose mood follows the agent's state.
 
 v1 target: **bober-1**. Its address and other host-specific values live only in the gitignored
 `secrets/` folder (template: `secrets.example/`). The app always runs
@@ -56,7 +56,7 @@ be replaced.
 | Bottom-left | **Needs you** first, in this order: `waiting_feedback` → skipped → failed (including stalled) → PRs ready for review, oldest first. Below that, about 8 **recently finished** tasks with outcome and relative time. |
 | Top-right | CPU, RAM, disk (busy % plus read/write MB/s) and GPU busy %. Each is a bar plus a 30-minute sparkline of 10 s window averages. |
 | GPU | Vendor-neutral, read from DRM fdinfo (`/proc/<pid>/fdinfo`). No capabilities needed. The app's own PID is excluded. Root-owned clients such as Xorg are not visible (accepted). NVML is added only if NVIDIA hardware appears. |
-| Bottom-right | ASCII beaver with 4 states (**working / idle / needs-you / broken**) and "**N** tasks finished since \<go-live date\>". **No slot display.** |
+| Bottom-right | ASCII animal with 4 states (**working / idle / needs-you / broken**) and "**N** tasks finished since \<go-live date\>". **No slot display.** |
 | Task data | **Pushed**, not scraped. Two entry points share one code path that writes a SQLite store: MCP over stdio (`hermes-beaver mcp`, spawned by Hermes) for the model, and `hermes-beaver call <tool> '<json>'` for scripts. The GUI only reads the store, except for reconciliation, which writes through the same tool code path. |
 | Who reports | The **Bober lifecycle is reported by code**: the gate tick sends the queue and task starts, `--mark` sends finishes, and closure detection sends closes. In Bober runs the model only reports `waiting_feedback`. For Telegram and Direct, the model reports start, update and finish, as instructed in SOUL.md. |
 | What a task is | A GitHub task is one Bober job (`new`, `update` or `go`) or one pr-review run. A Telegram or Direct task is one request that needs real work (tool use). Gate-only ticks, `humor` and `bober-queue-notes` are excluded. |
@@ -107,7 +107,7 @@ src/health.rs            health rules → HealthState
 src/reconcile.rs         closes orphaned GitHub tasks from the execution ledger
 src/brightness/          ddc.rs, gamma.rs, controller.rs (wake timer, fade steps)
 src/mask.rs              URL/token masking
-src/ui/                  app shell, screens/main.slint, components (bar, sparkline, task row), beaver/*.txt
+src/ui/                  app shell, screens/main.slint, components (bar, sparkline, task row), art/<animal>/*.txt
 src/demo.rs              fake data generator
 deploy/                  install.sh, hermes-beaver.service, hermes-beaver-autostart.desktop
 MCP.md, BOBER.md         hand-off docs for Bober
@@ -176,7 +176,7 @@ A `ref` resolves to the most recent unfinished task with that ref. Writers use W
 - Find the execution of that job with `started_at ≤ task.started_at ≤ finished_at`.
 - If that execution has finished, finish the task with `completed→done` or `failed→failed`, set `reconciled = true`, and use the summary "closed from cron ledger".
 
-**Health rules** (any match turns on the red banner and the broken beaver):
+**Health rules** (any match turns on the red banner and the broken animal):
 1. The heartbeat is older than `heartbeat_max_age_secs`: "Hermes gateway not responding".
 2. The last 2 executions of `agent_jobs` both have status `failed`: show the first line of `error`, masked.
 3. Bober `consecutive_failures > 0`.
@@ -299,7 +299,7 @@ Each phase ends with something visible on the real screen.
 
 **Phase 3: Task panels and beaver**
 - Top-left and bottom-left views from the store, the masking module (with tests), the stale rule, the counter and `go_live_at`.
-- Four original ASCII beaver frames, chosen by state.
+- Four ASCII frames per animal, chosen by state. The beaver is original; the squirrel's working frame is the art from idct.tech, and its other moods change the eyes and the bulb.
 - *Done when:* demo mode shows every list state, including overflow ("+N more"), empty lists, and each beaver state.
 
 **Phase 4: Health and reconciliation**
@@ -367,7 +367,7 @@ Spike results and implementation details that changed the plan above:
 - **DDC writes use `--skip-ddc-checks`** after a startup probe. Spike #3 measured about 60 ms per write instead of about 410 ms, with every read-back correct.
 - **Reconciliation matches by `cron_job_id`.** Spike #4 confirmed every gate dispatch falls inside its own job's execution window. The two slots' windows overlap, so the job id is required. The ledger keeps about 19 hours.
 - **"Needs you" groups 2–4 are GitHub-only.** Only refs have a close lifecycle. A failed Telegram task shows under "Recently finished".
-- **The beaver's needs-you sign ignores PRs waiting for review.** There are usually some, and the sign would never come down. The caption still counts them.
+- **The animal's needs-you sign ignores PRs waiting for review.** There are usually some, and the sign would never come down. The caption still counts them.
 
 ## 14. Added after v1
 

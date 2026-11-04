@@ -42,17 +42,31 @@ pub enum Renderer {
     Opengl,
 }
 
+/// The ASCII animal in the bottom-right panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Animal {
+    Beaver,
+    /// A ground squirrel at a laptop, from the art on idct.tech.
+    Squirrel,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UiConfig {
     /// `SLINT_BACKEND` in the environment overrides this.
     pub renderer: Renderer,
+    pub animal: Animal,
+    /// Title of the animal's panel. Unset: the animal's own name.
+    pub animal_name: Option<String>,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             renderer: Renderer::Software,
+            animal: Animal::Beaver,
+            animal_name: None,
         }
     }
 }
@@ -301,6 +315,16 @@ mod tests {
         assert_eq!(Config::default().ui.renderer, Renderer::Software);
         let c = Config::parse("[ui]\nrenderer = \"opengl\"").unwrap();
         assert_eq!(c.ui.renderer, Renderer::Opengl);
+    }
+
+    #[test]
+    fn animal_defaults_to_the_beaver() {
+        assert_eq!(Config::default().ui.animal, Animal::Beaver);
+        assert_eq!(Config::default().ui.animal_name, None);
+        let c = Config::parse("[ui]\nanimal = \"squirrel\"\nanimal_name = \"Suseł\"").unwrap();
+        assert_eq!(c.ui.animal, Animal::Squirrel);
+        assert_eq!(c.ui.animal_name.as_deref(), Some("Suseł"));
+        assert!(Config::parse("[ui]\nanimal = \"unicorn\"").is_err());
     }
 
     #[test]

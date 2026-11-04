@@ -77,6 +77,8 @@ pub fn run(
         Mode::Live => host.into(),
         Mode::Demo(_) => format!("{host} · demo").into(),
     });
+    window.set_mascot_title(view::mascot_title(&config.ui).into());
+    window.set_mascot_font_size(view::mascot_font_px(config.ui.animal));
     tick_clock(window.as_weak());
     window.window().set_fullscreen(!windowed);
 
@@ -308,7 +310,7 @@ impl App {
         );
         let (done, done_hint) = view::done_items(snap, now, done_rows);
         let mood = view::mood(&health, snap);
-        let (caption, tone) = view::beaver_caption(mood, snap);
+        let (caption, tone) = view::mascot_caption(mood, snap);
 
         w.set_banner(health.banner().into());
         w.set_tasks(model(tasks));
@@ -322,9 +324,9 @@ impl App {
             self.gpu_shown,
             view::loadavg(),
         )));
-        w.set_beaver_art(view::beaver_art(mood).into());
-        w.set_beaver_caption(caption.into());
-        w.set_beaver_tone(tone);
+        w.set_mascot_art(view::mascot_art(self.config.ui.animal, mood).into());
+        w.set_mascot_caption(caption.into());
+        w.set_mascot_tone(tone);
         w.set_counter(snap.done_count.to_string().into());
         w.set_counter_label(view::counter_label(snap.go_live_at).into());
     }
