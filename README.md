@@ -6,7 +6,8 @@ A lightweight, full-screen dashboard that runs next to [Hermes Agent](https://gi
 - what needs your feedback, and recently finished work;
 - CPU, memory, disk and GPU load, with 30-minute sparklines;
 - an ASCII beaver whose mood follows the agent (working, napping, needs you, broken);
-- a red banner when Hermes itself is unhealthy.
+- a red banner when Hermes itself is unhealthy;
+- a clock with ticking seconds, so you can tell at a glance that the screen isn't frozen.
 
 It dims the monitor backlight over DDC/CI when nothing is happening, and brightens it for a minute when something changes. The monitor goes into standby on a daily schedule (e.g. 23:00 to 09:00) and whenever you tell Hermes you're going to sleep or out (`/sleep`, `/awake`). Vacation mode (`/vacation`) keeps it off until you turn it back on. A key press or mouse move on the dashboard machine also wakes it.
 

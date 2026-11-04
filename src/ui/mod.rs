@@ -77,7 +77,7 @@ pub fn run(
         Mode::Live => host.into(),
         Mode::Demo(_) => format!("{host} · demo").into(),
     });
-    window.set_clock(clock_text().into());
+    tick_clock(window.as_weak());
     window.window().set_fullscreen(!windowed);
 
     window.on_quit(|| {
@@ -95,18 +95,6 @@ pub fn run(
     app.render(&window, store::now());
     app.sync_screen(store::now());
     let app = Rc::new(RefCell::new(app));
-
-    // Clock: check every second, touch the property (and redraw) only when it changes.
-    let clock_timer = Timer::default();
-    let weak = window.as_weak();
-    clock_timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
-        if let Some(w) = weak.upgrade() {
-            let now = clock_text();
-            if w.get_clock() != now.as_str() {
-                w.set_clock(now.into());
-            }
-        }
-    });
 
     // First metrics shortly after start, then every 10 s.
     let tick = {
@@ -395,8 +383,27 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "hermes".into())
 }
 
-fn clock_text() -> String {
-    chrono::Local::now().format("%H:%M").to_string()
+/// Shows the time and schedules itself just after the next wall-clock second, so the
+/// seconds tick evenly and never skip. The ticking seconds show at a glance that the
+/// dashboard is alive: the 10 s refresh runs on the same thread.
+fn tick_clock(weak: slint::Weak<MainWindow>) {
+    let Some(w) = weak.upgrade() else { return };
+    let now = chrono::Local::now();
+    let (clock, seconds) = clock_parts(&now);
+    if w.get_clock() != clock.as_str() {
+        w.set_clock(clock.into());
+    }
+    w.set_seconds(seconds.into());
+    let wait = 1_000 - u64::from(now.timestamp_subsec_millis().min(999)) + 20;
+    Timer::single_shot(Duration::from_millis(wait), move || tick_clock(weak));
+}
+
+/// "HH:MM" and ":SS".
+fn clock_parts<Tz: chrono::TimeZone>(t: &chrono::DateTime<Tz>) -> (String, String)
+where
+    Tz::Offset: std::fmt::Display,
+{
+    (t.format("%H:%M").to_string(), t.format(":%S").to_string())
 }
 
 /// Writes an RGBA buffer as binary PPM (alpha dropped). No image crate needed.
@@ -407,4 +414,75 @@ fn write_ppm(path: &Path, buf: &SharedPixelBuffer<Rgba8Pixel>) -> std::io::Resul
         out.extend_from_slice(&[p.r, p.g, p.b]);
     }
     std::fs::write(path, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
+    use slint::platform::{Platform, WindowAdapter};
+    use slint::{PhysicalSize, Rgb8Pixel};
+
+    const W: u32 = 1920;
+    const H: u32 = 1080;
+
+    struct Headless(Rc<MinimalSoftwareWindow>);
+
+    impl Platform for Headless {
+        fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn frame(win: &MinimalSoftwareWindow, buf: &mut [Rgb8Pixel]) {
+        win.request_redraw();
+        win.draw_if_needed(|r| {
+            r.render(buf, W as usize);
+        });
+    }
+
+    #[test]
+    fn clock_parts_split_minutes_and_seconds() {
+        let t = chrono::DateTime::parse_from_rfc3339("2026-11-04T00:54:07+01:00").unwrap();
+        assert_eq!(clock_parts(&t), ("00:54".into(), ":07".into()));
+    }
+
+    /// Like the dashboard on the host: the partial software renderer draws only what
+    /// changed into a reused buffer, other text changes every few seconds and the clock
+    /// once a minute. After a while the clock must still repaint (slint-ui/slint#14435:
+    /// the property changed, the screen kept the old time).
+    #[test]
+    fn clock_keeps_repainting_after_many_other_text_updates() {
+        let win = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
+        slint::platform::set_platform(Box::new(Headless(win.clone()))).unwrap();
+        let ui = MainWindow::new().unwrap();
+        ui.show().unwrap();
+        win.set_size(PhysicalSize::new(W, H));
+        let mut buf = vec![Rgb8Pixel::default(); (W * H) as usize];
+
+        ui.set_clock("23:40".into());
+        frame(&win, &mut buf);
+        ui.set_clock("23:41".into());
+        frame(&win, &mut buf);
+        // The text cache sweeps after 1024 shapings; on the host that took about 4 minutes.
+        for i in 0..1100 {
+            ui.set_counter(i.to_string().into());
+            frame(&win, &mut buf);
+        }
+        let before = buf.clone();
+        ui.set_clock("00:54".into());
+        frame(&win, &mut buf);
+        let changed = buf.iter().zip(&before).filter(|(a, b)| a != b).count();
+        assert!(changed > 0, "the clock changed but no pixel did");
+
+        // The same state drawn from scratch.
+        let mut fresh = vec![Rgb8Pixel::default(); (W * H) as usize];
+        win.request_redraw();
+        win.draw_if_needed(|r| {
+            r.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
+            r.render(&mut fresh, W as usize);
+        });
+        let differing = buf.iter().zip(&fresh).filter(|(a, b)| a != b).count();
+        assert_eq!(differing, 0, "incremental frame differs from a full redraw");
+    }
 }

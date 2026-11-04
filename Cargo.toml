@@ -31,3 +31,9 @@ slint-build = "1.18.1"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Slint 1.18.1 with the fix for slint-ui/slint#14435 (PR #14543): with the software
+# renderer, a Text that changes rarely (the clock) stopped repainting after ~1024 updates
+# to other text. Drop this and vendor/ once a Slint release includes the fix.
+[patch.crates-io]
+i-slint-core = { path = "vendor/i-slint-core" }

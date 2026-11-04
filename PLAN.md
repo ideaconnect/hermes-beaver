@@ -64,7 +64,7 @@ be replaced.
 | Reconciliation | A GitHub task still `working` after its cron execution ended is closed from that execution's status. A Telegram or Direct task with no update for 30 minutes shows as `stale?`. No Hermes plugin is used. |
 | Counter | Counts tasks finished with outcome `done`, starting at go-live. It only increases. **No backfill.** |
 | Masking | Every displayed title or note has URLs cut to the host (`hooks.example.com/…`) and long token-like strings replaced with `••••`. |
-| Refresh | One 10 s tick. The clock updates once a minute. Hermes files are re-read only when their mtime changes. |
+| Refresh | One 10 s tick. The clock ticks every second, seconds dimmed, so a frozen screen shows at once. Hermes files are re-read only when their mtime changes. |
 | Brightness | Monitor backlight via **DDC/CI** (`ddcutil`): 20% when idle, 80% for 60 s on an event. Falls back to RandR gamma (`xrandr --brightness`) when DDC is unavailable. |
 | Wake events | A task queued, started or finished, a new feedback item, or a health state change. Metric updates never wake the screen. |
 | Hermes changes | This repo **never writes into `~/.hermes`**. It ships `MCP.md` and `BOBER.md`; Bober applies the changes to its own scripts, skills, SOUL.md and config. |
@@ -393,3 +393,5 @@ Spike results and implementation details that changed the plan above:
   - **Hermes:**
     - quick commands `/sleep`, `/awake` and `/vacation` (zero tokens; `/wake` is a Hermes built-in) run `hermes-beaver display …`, which prints one line;
     - a SOUL.md rule covers natural-language requests.
+- **Ticking seconds.** The clock shows dimmed seconds, so a glance tells whether the dashboard is alive (the 10 s refresh runs on the same thread). The seconds are scheduled just after each wall-clock second, so they never skip.
+- **Patched Slint core.** In Slint 1.18.x the software renderer stopped repainting a Text that changes rarely after about 1024 updates to other text ([slint#14435](https://github.com/slint-ui/slint/issues/14435)): the clock froze while the rest of the screen kept updating. `vendor/i-slint-core` is 1.18.1 with the upstream fix ([slint#14543](https://github.com/slint-ui/slint/pull/14543)), wired in through `[patch.crates-io]`; see `vendor/README.md`.

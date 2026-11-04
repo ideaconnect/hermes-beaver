@@ -7,6 +7,7 @@ export { TaskItem, NeedItem, DoneItem, MetricItem }
 component MainScreen inherits VerticalLayout {
     in property <string> hostname;
     in property <string> clock;
+    in property <string> seconds;
     in property <string> banner;
     in property <[TaskItem]> tasks;
     in property <string> tasks-hint;
@@ -53,12 +54,23 @@ component MainScreen inherits VerticalLayout {
             }
         }
 
-        Text {
-            text: root.clock;
-            color: Theme.text;
-            font-size: Theme.font-header;
-            font-weight: 700;
-            vertical-alignment: center;
+        HorizontalLayout {
+            Text {
+                text: root.clock;
+                color: Theme.text;
+                font-size: Theme.font-header;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+
+            // Ticks every second: if the seconds stop, the dashboard is frozen.
+            Text {
+                text: root.seconds;
+                color: Theme.text-dim;
+                font-size: Theme.font-header;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
         }
     }
 
@@ -187,6 +199,7 @@ component MainScreen inherits VerticalLayout {
 export component MainWindow inherits Window {
     in property <string> hostname: "hermes";
     in property <string> clock: "--:--";
+    in property <string> seconds;
     in property <string> banner: "";
     in property <[TaskItem]> tasks;
     in property <string> tasks-hint;
@@ -226,6 +239,7 @@ export component MainWindow inherits Window {
         MainScreen {
             hostname: root.hostname;
             clock: root.clock;
+            seconds: root.seconds;
             banner: root.banner;
             tasks: root.tasks;
             tasks-hint: root.tasks-hint;
