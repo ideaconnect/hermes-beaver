@@ -27,6 +27,7 @@ Add these calls where the script already makes the matching decision:
 | When the script… | Call |
 |---|---|
 | has computed the prioritised queue on a tick (update → go → new), **every tick, including when it is empty** | `beaver("queue_set", items=[{"ref": key, "mode": mode, "title": title, "url": issue_url}, …])`, listing every pending job **except** the one being dispatched now |
+| runs `--queue-notes` (the watcher between ticks, while every slot is busy), after its `collect()` | the same `queue_set`, built the way the gate builds its queue: `collect()`'s updates, go jobs and pickups without the items `running_jobs(state)` lists, through `queue_items()`. Send it on every run that gets past the "a slot is free" check, also when no note is posted |
 | dispatches a job | `beaver("task_start", source="github", kind=mode, title=title, ref=key, url=issue_url, cron_job_id=JOB_ID)` |
 | sees an issue or PR closed or merged (where it marks the state `closed`) | `beaver("task_closed", ref=key)` |
 | gives up on an update after repeated attempts (stalled) | `beaver("task_finish", ref=key, outcome="failed", summary="stalled after N attempts")` |
@@ -35,6 +36,7 @@ Notes:
 - `key` is the existing state key, `owner/repo#N`. For GO jobs use the PR's key.
 - The title comes from `issue.json` / `pr.json` in the work dir. Use the issue title only, never the body.
 - A dispatch that fails before the agent starts (as with the provider-credential errors) needs no extra call. The dashboard closes the task from the cron ledger.
+- The gate does not tick while its slot runs a job. With every slot busy, only `--queue-notes` sees new work, so without its `queue_set` the dashboard keeps showing the queue from the last dispatch until a slot frees up.
 
 ## 4. Report from `--mark`
 
@@ -127,7 +129,7 @@ The dashboard also switches the monitor on its own daily schedule (`[display]` i
 ## 9. Check
 
 1. Run `~/.local/bin/hermes-beaver call queue_set '{"items":[]}'`. It should print `{"changed":…,"count":0}`.
-2. After the next gate tick (≤ 6 minutes), the dashboard's queue matches the pending jobs.
+2. After the next gate tick (≤ 6 minutes), the dashboard's queue matches the pending jobs. While both slots are busy, label a new issue: it appears as queued after the next `--queue-notes` run, together with its "In the queue, Mate!" note.
 3. When a job is dispatched, it moves from queued to working. After `--mark done` it appears under "Recently finished", and under "Needs you" as ready for review. Closing the issue removes it.
 4. A Telegram request that needs tools shows up as a `TG` task and finishes.
 5. `/sleep` in Telegram answers `Screen off until …` and turns the monitor off within 10 seconds. `/awake` turns it back on. `/vacation` answers `Vacation mode: …`; then `/awake` ends it.
