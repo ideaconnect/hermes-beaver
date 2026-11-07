@@ -1,7 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=hermes-beaver
-Comment=Hermes Agent dashboard
-Exec=sh -c 'xset s off; xset s noblank; xset -dpms; systemctl --user import-environment DISPLAY XAUTHORITY; systemctl --user restart hermes-beaver.service'
-NoDisplay=true
-X-GNOME-Autostart-enabled=true

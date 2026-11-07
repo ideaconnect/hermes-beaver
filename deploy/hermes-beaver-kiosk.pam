@@ -1,0 +1,6 @@
+#%PAM-1.0
+# hermes-beaver-kiosk.service: systemd starts sway as the desktop user, without a
+# password. The session stack (pam_systemd) gives it a logind session on seat0.
+auth     required pam_permit.so
+@include common-account
+@include common-session

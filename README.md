@@ -9,9 +9,9 @@ A lightweight, full-screen dashboard that runs next to [Hermes Agent](https://gi
 - a red banner when Hermes itself is unhealthy;
 - a clock with ticking seconds, so you can tell at a glance that the screen isn't frozen.
 
-It dims the monitor backlight over DDC/CI when nothing is happening, and brightens it for a minute when something changes. The monitor goes into standby on a daily schedule (e.g. 23:00 to 09:00) and whenever you tell Hermes you're going to sleep or out (`/sleep`, `/awake`). Vacation mode (`/vacation`) keeps it off until you turn it back on. A key press or mouse move on the dashboard machine also wakes it.
+It dims the monitor backlight over DDC/CI when nothing is happening, and brightens it for a minute when something changes. The monitor goes into standby on a daily schedule (e.g. 23:00 to 09:00) and whenever you tell Hermes you're going to sleep or out (`/sleep`, `/awake`). Vacation mode (`/vacation`) keeps it off until you turn it back on. A key press or mouse move on the dashboard machine also wakes it, until ten minutes pass without input.
 
-Written in Rust with [Slint](https://slint.dev): one binary of about 13 MB that idles at about 0% CPU and about 30 MB RSS. Hermes reports its work over MCP (see [MCP.md](MCP.md)). [PLAN.md](PLAN.md) has the design; the [project board](https://github.com/orgs/ideaconnect/projects/7) tracks progress.
+Written in Rust with [Slint](https://slint.dev): one binary of about 17 MB that idles at about 0% CPU and about 40 MB RSS (16 MB of it are the two frame buffers it shares with the compositor). It's a Wayland client. On the host it runs in a kiosk session: [sway](https://swaywm.org) with no bar, no menus and no Xwayland, rendering on the GPU. Hermes reports its work over MCP (see [MCP.md](MCP.md)). [PLAN.md](PLAN.md) has the design; the [project board](https://github.com/orgs/ideaconnect/projects/7) tracks progress.
 
 ## Commands
 
@@ -40,16 +40,17 @@ Deployment targets and per-host config live in `secrets/`, which is gitignored:
 
 ```sh
 cp -r secrets.example secrets
-$EDITOR secrets/deploy.env secrets/config.toml
+$EDITOR secrets/deploy.env secrets/config.toml secrets/sway.conf
 make deploy
 ```
 
 `make deploy` builds a release locally, copies it to the host, and runs [`deploy/install.sh`](deploy/install.sh) there as root. The script:
-- installs the binary, a systemd user unit and an XFCE autostart entry;
-- keeps the screen from blanking;
-- sets up `ddcutil` for brightness and `xset` for standby.
+- installs `sway`, `ddcutil` (brightness) and `wlopm` (standby), without recommended packages, so no Xwayland;
+- installs the binary, its systemd user unit, and the sway config [`deploy/sway.conf`](deploy/sway.conf) plus the host's `secrets/sway.conf` (outputs and modes);
+- replaces the display manager with the kiosk session: [`hermes-beaver-kiosk.service`](deploy/hermes-beaver-kiosk.service) runs sway on tty7 as the desktop user. LightDM is disabled and masked, so no X server starts. Sway starts the dashboard;
+- restarts sway only when its config changed, otherwise just the dashboard.
 
-Run it again at any time; it's idempotent. When a release adds MCP tools, send `/reload-mcp` to Hermes afterwards so the model sees them.
+Run it again at any time; it's idempotent. To go back to X: `systemctl disable --now hermes-beaver-kiosk && systemctl unmask lightdm && systemctl enable --now lightdm` (and deploy a build with Slint's `backend-winit-x11`). When a release adds MCP tools, send `/reload-mcp` to Hermes afterwards so the model sees them.
 
 To connect Hermes, give [BOBER.md](BOBER.md) to the agent: it lists the changes to make on the Hermes side.
 
@@ -70,7 +71,7 @@ stale_after_mins = 30        # Telegram/CLI tasks without updates show "stale?"
 finished_rows = 8
 
 [brightness]
-method = "auto"              # auto (DDC/CI, else gamma) | ddc | gamma | off
+method = "auto"              # auto (DDC/CI, else dim) | ddc | dim (dark overlay) | off
 idle = 20
 active = 80
 active_secs = 60
@@ -84,7 +85,7 @@ off_at = "23:00"             # daily standby; both default to none (no schedule)
 on_at = "09:00"              # leave it out to stay off until turned on
 
 [ui]
-renderer = "software"        # software (~24 MB) | opengl (~95 MB); SLINT_BACKEND overrides
+renderer = "software"        # software (~40 MB RSS) | opengl (~110 MB, draws on the GPU); SLINT_BACKEND overrides
 animal = "beaver"            # the ASCII animal: beaver | squirrel
 animal_name = "Beaver"       # its panel's title (shown in capitals); default: the animal's name
 ```

@@ -217,8 +217,12 @@ export component MainWindow inherits Window {
     in property <int> mascot-tone;
     in property <string> counter: "0";
     in property <string> counter-label;
+    // Opacity of the black overlay that dims the picture without DDC/CI; 0 = clear.
+    in property <float> dim: 0;
     callback quit();
     callback toggle-fullscreen();
+    // A key press or pointer move; returns whether it woke the monitor from standby.
+    callback user-input() -> bool;
 
     title: "hermes-beaver";
     preferred-width: 1920px;
@@ -229,6 +233,10 @@ export component MainWindow inherits Window {
 
     keys := FocusScope {
         key-pressed(event) => {
+            // The key that wakes the monitor does nothing else.
+            if (root.user-input()) {
+                return accept;
+            }
             if (event.text == Key.Escape || event.text == "q") {
                 root.quit();
                 return accept;
@@ -261,9 +269,20 @@ export component MainWindow inherits Window {
             counter-label: root.counter-label;
         }
 
+        if root.dim > 0: Rectangle {
+            background: rgba(0, 0, 0, root.dim);
+        }
+
         // Display-only dashboard: hide the pointer everywhere.
         TouchArea {
             mouse-cursor: none;
+            pointer-event(event) => {
+                root.user-input();
+            }
+            scroll-event(event) => {
+                root.user-input();
+                reject
+            }
         }
     }
 }

@@ -10,12 +10,14 @@
 //! an `off` with `until` holds until that time even across a scheduled switch on,
 //! and vacation holds until `display_on`.
 //!
-//! The monitor is switched with X DPMS. `xset dpms force off` puts it into
-//! standby and, as a side effect, enables DPMS. `xset -dpms` wakes it and
-//! disables DPMS again, so the X idle timeouts never blank the dashboard on their
-//! own. Checked on the target: the HDMI connector goes Off and back On, and
-//! DDC/CI still answers in standby. A key press or mouse move also wakes a
-//! forced-off monitor; the requested state doesn't change.
+//! The monitor is switched through the Wayland compositor with `wlopm` (the
+//! wlr-output-power-management protocol, which sway implements): `wlopm --off '*'`
+//! puts every output into standby and `wlopm --on '*'` wakes them. The compositor
+//! never blanks the dashboard on its own: the kiosk session runs no idle daemon.
+//!
+//! A key press or pointer move wakes a monitor in standby without changing the
+//! requested state. After [`INPUT_WAKE_SECS`] without input it goes back into
+//! standby (the X DPMS timeout the dashboard had before Wayland).
 
 use std::process::{Command, Stdio};
 
@@ -176,32 +178,31 @@ pub trait Power {
     fn set_on(&mut self, on: bool) -> Result<()>;
 }
 
-/// X DPMS through `xset` (package x11-xserver-utils).
-pub struct Dpms;
+/// Output power through the compositor, with `wlopm` (package wlopm).
+pub struct OutputPower;
 
-impl Power for Dpms {
+impl Power for OutputPower {
     fn set_on(&mut self, on: bool) -> Result<()> {
-        let args: &[&str] = if on {
-            &["-dpms"]
-        } else {
-            &["dpms", "force", "off"]
-        };
-        let out = Command::new("xset")
-            .args(args)
+        let flag = if on { "--on" } else { "--off" };
+        let out = Command::new("wlopm")
+            .args([flag, "*"])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .output()
-            .context("running xset (is x11-xserver-utils installed?)")?;
+            .context("running wlopm (is it installed?)")?;
         if !out.status.success() {
             bail!(
-                "xset {} failed: {}",
-                args.join(" "),
+                "wlopm {flag} failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
         Ok(())
     }
 }
+
+/// How long a monitor woken by input stays on without further input while it
+/// should be in standby.
+pub const INPUT_WAKE_SECS: i64 = 600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
@@ -216,23 +217,57 @@ pub struct Screen {
     power: Box<dyn Power>,
     /// Last applied state, `Some(true)` = off. `None` before the first sync.
     off: Option<bool>,
+    /// Woken by input while it should be off: the time of the last input.
+    woken: Option<i64>,
 }
 
 impl Screen {
     pub fn new(power: Box<dyn Power>) -> Self {
-        Self { power, off: None }
+        Self {
+            power,
+            off: None,
+            woken: None,
+        }
     }
 
+    /// In standby now: switched off and not woken by input since.
     pub fn is_off(&self) -> bool {
-        self.off == Some(true)
+        self.off == Some(true) && self.woken.is_none()
+    }
+
+    /// A key press or pointer move at `now`. Wakes a monitor in standby; the requested
+    /// state doesn't change. Returns whether this input woke it.
+    pub fn input(&mut self, now: i64) -> bool {
+        if self.off != Some(true) {
+            return false;
+        }
+        let woke = self.woken.is_none();
+        self.woken = Some(now);
+        if woke {
+            match self.power.set_on(true) {
+                Ok(()) => eprintln!("hermes-beaver: monitor on (input)"),
+                Err(e) => eprintln!("hermes-beaver: waking the monitor failed: {e:#}"),
+            }
+        }
+        woke
     }
 
     /// The first call applies the state either way: after a restart the monitor
-    /// may still be in standby from the previous run.
-    pub fn sync(&mut self, want_off: bool) -> Change {
+    /// may still be in standby from the previous run. A monitor woken by input goes
+    /// back into standby after [`INPUT_WAKE_SECS`] without input.
+    pub fn sync(&mut self, want_off: bool, now: i64) -> Change {
         if self.off == Some(want_off) {
-            return Change::None;
+            if !self.woken.is_some_and(|last| now - last >= INPUT_WAKE_SECS) {
+                return Change::None;
+            }
+            self.woken = None;
+            match self.power.set_on(false) {
+                Ok(()) => eprintln!("hermes-beaver: monitor off again (no input)"),
+                Err(e) => eprintln!("hermes-beaver: switching the monitor failed: {e:#}"),
+            }
+            return Change::TurnedOff;
         }
+        self.woken = None;
         let first = self.off.is_none();
         match self.power.set_on(!want_off) {
             Ok(()) if want_off => eprintln!("hermes-beaver: monitor off (standby)"),
@@ -424,16 +459,16 @@ mod tests {
     fn applies_only_changes_and_restores_on_drop() {
         let (mut s, log) = screen();
         assert_eq!(
-            s.sync(false),
+            s.sync(false, 0),
             Change::None,
             "startup: on, nothing to report"
         );
-        assert_eq!(s.sync(false), Change::None);
-        assert_eq!(s.sync(true), Change::TurnedOff);
+        assert_eq!(s.sync(false, 0), Change::None);
+        assert_eq!(s.sync(true, 0), Change::TurnedOff);
         assert!(s.is_off());
-        assert_eq!(s.sync(true), Change::None);
-        assert_eq!(s.sync(false), Change::TurnedOn);
-        assert_eq!(s.sync(true), Change::TurnedOff);
+        assert_eq!(s.sync(true, 0), Change::None);
+        assert_eq!(s.sync(false, 0), Change::TurnedOn);
+        assert_eq!(s.sync(true, 0), Change::TurnedOff);
         drop(s);
         assert_eq!(*log.lock().unwrap(), vec![true, false, true, false, true]);
     }
@@ -441,7 +476,7 @@ mod tests {
     #[test]
     fn starting_while_asleep_turns_it_off() {
         let (mut s, log) = screen();
-        assert_eq!(s.sync(true), Change::TurnedOff);
+        assert_eq!(s.sync(true, 0), Change::TurnedOff);
         assert_eq!(*log.lock().unwrap(), vec![false]);
     }
 
@@ -451,11 +486,42 @@ mod tests {
         impl Power for Broken {
             fn set_on(&mut self, _: bool) -> Result<()> {
                 self.0 += 1;
-                bail!("no X")
+                bail!("no compositor")
             }
         }
         let mut s = Screen::new(Box::new(Broken(0)));
-        assert_eq!(s.sync(true), Change::TurnedOff);
-        assert_eq!(s.sync(true), Change::None);
+        assert_eq!(s.sync(true, 0), Change::TurnedOff);
+        assert_eq!(s.sync(true, 0), Change::None);
+    }
+
+    #[test]
+    fn input_wakes_standby_until_a_quiet_spell() {
+        let (mut s, log) = screen();
+        assert!(!s.input(0), "already on: nothing to wake");
+        assert_eq!(s.sync(true, 0), Change::TurnedOff);
+        assert!(s.input(100), "woke the monitor");
+        assert!(!s.is_off());
+        assert!(!s.input(200), "already awake");
+        // Each input restarts the quiet spell.
+        assert_eq!(s.sync(true, 200 + INPUT_WAKE_SECS - 1), Change::None);
+        assert_eq!(s.sync(true, 200 + INPUT_WAKE_SECS), Change::TurnedOff);
+        assert!(s.is_off());
+        assert_eq!(s.sync(true, 200 + 2 * INPUT_WAKE_SECS), Change::None);
+        assert_eq!(*log.lock().unwrap(), vec![false, true, false]);
+    }
+
+    #[test]
+    fn a_requested_change_ends_an_input_wake() {
+        let (mut s, log) = screen();
+        s.sync(true, 0);
+        s.input(10);
+        assert_eq!(s.sync(false, 20), Change::TurnedOn);
+        // Off again later: input wakes it again, the quiet spell starts afresh.
+        assert_eq!(s.sync(true, 30), Change::TurnedOff);
+        assert_eq!(s.sync(true, 30 + INPUT_WAKE_SECS), Change::None);
+        assert!(s.input(40));
+        drop(s);
+        // Dropping an input-woken screen doesn't switch it again: it's on.
+        assert_eq!(*log.lock().unwrap(), vec![false, true, true, false, true]);
     }
 }

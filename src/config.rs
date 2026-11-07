@@ -36,9 +36,10 @@ pub struct DisplayConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Renderer {
-    /// CPU rasteriser: ~24 MB RSS on the target, same CPU as OpenGL at this refresh rate.
+    /// CPU rasteriser: ~40 MB RSS on the target (16 MB of it the frame buffers shared with
+    /// the compositor), same CPU as OpenGL at this refresh rate.
     Software,
-    /// OpenGL (femtovg): ~95 MB RSS on the target.
+    /// OpenGL (femtovg): ~110 MB RSS on the target.
     Opengl,
 }
 
@@ -91,9 +92,13 @@ pub struct TasksConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BrightnessMethod {
+    /// DDC/CI, else `dim`.
     Auto,
     Ddc,
-    Gamma,
+    /// The dashboard dims itself with an overlay. `gamma` is the name from the X11
+    /// days, when this was the RandR gamma ramp.
+    #[serde(alias = "gamma")]
+    Dim,
     Off,
 }
 
@@ -305,8 +310,14 @@ mod tests {
 
     #[test]
     fn brightness_method_parses() {
+        let c = Config::parse("[brightness]\nmethod = \"dim\"").unwrap();
+        assert_eq!(c.brightness.method, BrightnessMethod::Dim);
         let c = Config::parse("[brightness]\nmethod = \"gamma\"").unwrap();
-        assert_eq!(c.brightness.method, BrightnessMethod::Gamma);
+        assert_eq!(
+            c.brightness.method,
+            BrightnessMethod::Dim,
+            "the old name still works"
+        );
         assert!(Config::parse("[brightness]\nmethod = \"laser\"").is_err());
     }
 

@@ -70,8 +70,12 @@ pub fn run(
 ) -> Result<()> {
     select_backend(config.ui.renderer);
 
-    let mut app = App::new(config.clone(), &mode, store_path)?;
     let window = MainWindow::new().context("creating the main window")?;
+    // The Wayland app_id, for the compositor's logs and window rules.
+    if let Err(e) = slint::set_xdg_app_id("hermes-beaver") {
+        eprintln!("hermes-beaver: setting the app id failed: {e}");
+    }
+    let mut app = App::new(config.clone(), &mode, store_path, window.as_weak())?;
     let host = hostname();
     window.set_hostname(match mode {
         Mode::Live => host.into(),
@@ -97,6 +101,18 @@ pub fn run(
     app.render(&window, store::now());
     app.sync_screen(store::now());
     let app = Rc::new(RefCell::new(app));
+
+    window.on_user_input({
+        let app = app.clone();
+        move || {
+            let a = &mut *app.borrow_mut();
+            let woke = a.screen.as_mut().is_some_and(|s| s.input(store::now()));
+            if woke && let Some(b) = &a.brightness {
+                b.wake();
+            }
+            woke
+        }
+    });
 
     // First metrics shortly after start, then every 10 s.
     let tick = {
@@ -156,7 +172,12 @@ pub fn run(
 }
 
 impl App {
-    fn new(config: Config, mode: &Mode, store_path: &Path) -> Result<Self> {
+    fn new(
+        config: Config,
+        mode: &Mode,
+        store_path: &Path,
+        window: slint::Weak<MainWindow>,
+    ) -> Result<Self> {
         let base = |store, store_error, source: Box<dyn Source>, metrics, gpu_shown| Self {
             config: config.clone(),
             store,
@@ -194,11 +215,14 @@ impl App {
                     config.hermes.agent_jobs.clone(),
                 ));
                 let method = config.brightness.method;
+                let dim = brightness::Dim::new(move |opacity| {
+                    let _ = window.upgrade_in_event_loop(move |w| w.set_dim(opacity));
+                });
                 app.brightness = Some(Controller::start(
                     Levels::from(&config.brightness),
-                    move || brightness::select(method),
+                    move || brightness::select(method, dim),
                 ));
-                app.screen = Some(Screen::new(Box::new(display::Dpms)));
+                app.screen = Some(Screen::new(Box::new(display::OutputPower)));
                 app
             }
             Mode::Demo(scenario) => {
@@ -291,7 +315,7 @@ impl App {
     fn sync_screen(&mut self, now: i64) -> Change {
         let want_off = display::wants_off(&self.snapshot.display, &self.schedule, now);
         match &mut self.screen {
-            Some(s) => s.sync(want_off),
+            Some(s) => s.sync(want_off, now),
             None => Change::None,
         }
     }

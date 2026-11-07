@@ -14,11 +14,12 @@ rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 signal-hook = "0.4.6"
-# X11 only, both renderers (OpenGL default, software fallback), no accessibility/tray.
+# Wayland only (winit is built without X11), both renderers (software default, OpenGL),
+# no accessibility/tray.
 slint = { version = "1.18.1", default-features = false, features = [
     "std",
     "compat-1-2",
-    "backend-winit-x11",
+    "backend-winit-wayland",
     "renderer-femtovg",
     "renderer-software",
 ] }

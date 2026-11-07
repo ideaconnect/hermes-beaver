@@ -65,7 +65,7 @@ be replaced.
 | Counter | Counts tasks finished with outcome `done`, starting at go-live. It only increases. **No backfill.** |
 | Masking | Every displayed title or note has URLs cut to the host (`hooks.example.com/…`) and long token-like strings replaced with `••••`. |
 | Refresh | One 10 s tick. The clock ticks every second, seconds dimmed, so a frozen screen shows at once. Hermes files are re-read only when their mtime changes. |
-| Brightness | Monitor backlight via **DDC/CI** (`ddcutil`): 20% when idle, 80% for 60 s on an event. Falls back to RandR gamma (`xrandr --brightness`) when DDC is unavailable. |
+| Brightness | Monitor backlight via **DDC/CI** (`ddcutil`): 20% when idle, 80% for 60 s on an event. Falls back to dimming the picture when DDC is unavailable: RandR gamma under X, a dark overlay since the move to Wayland (§14). |
 | Wake events | A task queued, started or finished, a new feedback item, or a health state change. Metric updates never wake the screen. |
 | Hermes changes | This repo **never writes into `~/.hermes`**. It ships `MCP.md` and `BOBER.md`; Bober applies the changes to its own scripts, skills, SOUL.md and config. |
 | Deploy | Build on WSL. `make deploy` reads `secrets/deploy.env` (the whole `secrets/` folder is gitignored), copies files to the host, and runs an idempotent `install.sh`. |
@@ -85,7 +85,7 @@ be replaced.
                                                   ▼
  Hermes files (read-only) ─────────────►  hermes-beaver (GUI)  ◄──── /proc, /sys, fdinfo
    heartbeat, executions.db,                      │
-   jobs.json, bober/state.json                    └──► ddcutil setvcp 10 (or xrandr gamma)
+   jobs.json, bober/state.json                    └──► ddcutil setvcp 10 (or a dim overlay)
 ```
 
 **Subcommands**
@@ -105,11 +105,11 @@ src/metrics/             cpu.rs, mem.rs, disk.rs, gpu.rs (fdinfo), history.rs (r
 src/hermes/              read-only Hermes readers: heartbeat, executions, jobs, bober state
 src/health.rs            health rules → HealthState
 src/reconcile.rs         closes orphaned GitHub tasks from the execution ledger
-src/brightness/          ddc.rs, gamma.rs, controller.rs (wake timer, fade steps)
+src/brightness/          ddc.rs, dim.rs, controller.rs (wake timer, fade steps)
 src/mask.rs              URL/token masking
 src/ui/                  app shell, screens/main.slint, components (bar, sparkline, task row), art/<animal>/*.txt
 src/demo.rs              fake data generator
-deploy/                  install.sh, hermes-beaver.service, hermes-beaver-autostart.desktop
+deploy/                  install.sh, hermes-beaver.service, sway.conf, hermes-beaver-kiosk.{service,pam}
 MCP.md, BOBER.md         hand-off docs for Bober
 Makefile
 secrets.example/         committed template for the gitignored secrets/ (deploy.env, config.toml)
@@ -202,10 +202,10 @@ A `ref` resolves to the most recent unfinished task with that ref. Writers use W
 ## 6. Brightness
 
 - **Startup detection:**
-  - `method = auto`: run `ddcutil detect --brief`, cache the bus number, then read VCP `0x10`. On success use DDC; otherwise use gamma.
+  - `method = auto`: run `ddcutil detect --brief`, cache the bus number, then read VCP `0x10`. On success use DDC; otherwise use dim.
   - The Dell's on-screen menu must have DDC/CI enabled. The detection message tells you if it isn't.
 - **DDC:** `ddcutil --bus N --noverify setvcp 10 <level>`. Fade 20→80 in 3 steps over about 1 s. Each event causes about 2 writes, which protects the monitor's EEPROM.
-- **Gamma:** `xrandr --output <connected output> --brightness <0.2…0.8>`. Reset to `1.0` on exit.
+- **Dim:** a black overlay drawn by the dashboard itself, with opacity `1 − level/100`. It needs nothing from the compositor. (Under X this was `xrandr --brightness`, and `gamma` still parses as its name.)
 - **Controller:**
   - A new wake event sets the level to active and restarts the timer.
   - After `active_secs` with no new events, fade back to idle.
@@ -228,17 +228,14 @@ A `ref` resolves to the most recent unfinished task with that ref. Writers use W
   2. `scp` the binary and `deploy/` to a temporary directory on the host.
   3. `ssh` and run `install.sh` as root.
 - **`install.sh`** (idempotent; prints each action):
-  1. `apt-get install -y ddcutil` if missing. Add `DEPLOY_USER` to the `i2c` group and reload the udev rules.
+  1. `apt-get install --no-install-recommends` the missing ones of `ddcutil`, `sway` and `wlopm`. Without recommends, no Xwayland. Add `DEPLOY_USER` to the `i2c` group and reload the udev rules.
   2. Install the binary to `~DEPLOY_USER/.local/bin/hermes-beaver` with an atomic rename.
-  3. Install `~/.config/systemd/user/hermes-beaver.service`:
-     - `Restart=on-failure`
-     - `RestartSec=5`
-     - `PassEnvironment=DISPLAY XAUTHORITY`
-  4. Install `~/.config/autostart/hermes-beaver.desktop`. It runs `xset s off -dpms`, then `systemctl --user import-environment DISPLAY XAUTHORITY`, then `systemctl --user start hermes-beaver`.
-  5. Turn off XFCE blanking with `xfconf-query` on the user's session bus: `xfce4-power-manager` DPMS and blank settings, and the `xfce4-screensaver` saver.
-  6. Restart the GUI with `systemctl --user -M $DEPLOY_USER@ restart hermes-beaver`.
-  7. If a `hermes-beaver mcp` process is running, `pkill` it so Hermes respawns the new binary. **Schema migrations must therefore be backward compatible.**
-  8. Install `secrets/config.toml` as `~/.config/hermes-beaver/config.toml` if it exists. Otherwise write a default config, but only if none exists.
+  3. Install `secrets/config.toml` as `~/.config/hermes-beaver/config.toml` if it exists. Otherwise write a default config, but only if none exists.
+  4. Install `~/.config/systemd/user/hermes-beaver.service` (`Restart=always`, `RestartSec=5`), `deploy/sway.conf` as `~/.config/hermes-beaver/sway.conf`, and `secrets/sway.conf` as `~/.config/hermes-beaver/sway.d/host.conf`. Check the sway config with `sway --validate` on the headless backend, and stop if it fails.
+  5. Install the kiosk session: `/etc/pam.d/hermes-beaver-kiosk` and `/etc/systemd/system/hermes-beaver-kiosk.service`, which is aliased as `display-manager.service`. Disable, stop and mask the display manager it replaces (LightDM), then enable the kiosk.
+  6. Unset what the X session exported into the user manager (`DISPLAY`, `XAUTHORITY`, the XFCE `XDG_*` paths).
+  7. Start the kiosk if it isn't running. Restart it if its files changed, which makes sway restart the dashboard. Otherwise restart just the dashboard.
+  8. If a `hermes-beaver mcp` process is running, `pkill` it so Hermes respawns the new binary. **Schema migrations must therefore be backward compatible.**
 
 ---
 
@@ -384,10 +381,10 @@ Spike results and implementation details that changed the plan above:
     - Vacation ignores the schedule until `display_on`.
   - **Replies:** every result says when the state next changes by itself, so Hermes can confirm "off until 09:00".
   - **`timezone`** in the config sets `TZ` at startup. The target runs on UTC while the owner is in Europe/Warsaw; this fixes the clock too, without touching the host's zone, which Hermes also uses.
-  - **Switching** happens on the GUI's tick, through X DPMS:
-    - `xset dpms force off` puts the monitor into standby. It also enables DPMS, with the X default 600 s timeouts.
-    - `xset -dpms` wakes the monitor and disables DPMS again, so X never blanks the dashboard by itself.
-    - Checked on the target: the HDMI connector goes Off and On, and DDC/CI still answers in standby.
+  - **Switching** happens on the GUI's tick, through the compositor (originally X DPMS; see *Wayland kiosk* below):
+    - `wlopm --off '*'` puts the monitor into standby, and `wlopm --on '*'` wakes it.
+    - Checked on the target: the HDMI connector's DPMS goes Off and On, and DDC/CI still answers in standby.
+    - A key press or pointer move wakes it without changing the request. After 600 s without input it goes back into standby; that was the X DPMS default timeout. The key that wakes the monitor does nothing else, so an Esc doesn't also quit.
   - **Brightness:** in standby, events don't trigger the brightness boost. Waking gives the usual active minute.
   - **Restarts:** a restart re-applies standby. Stopping the dashboard wakes the monitor.
   - **Hermes:**
@@ -395,3 +392,10 @@ Spike results and implementation details that changed the plan above:
     - a SOUL.md rule covers natural-language requests.
 - **Ticking seconds.** The clock shows dimmed seconds, so a glance tells whether the dashboard is alive (the 10 s refresh runs on the same thread). The seconds are scheduled just after each wall-clock second, so they never skip.
 - **Patched Slint core.** In Slint 1.18.x the software renderer stopped repainting a Text that changes rarely after about 1024 updates to other text ([slint#14435](https://github.com/slint-ui/slint/issues/14435)): the clock froze while the rest of the screen kept updating. `vendor/i-slint-core` is 1.18.1 with the upstream fix ([slint#14543](https://github.com/slint-ui/slint/pull/14543)), wired in through `[patch.crates-io]`; see `vendor/README.md`.
+- **Wayland kiosk** (2026-11-07, on `susel`: Ubuntu 26.10, 12 cores, AMD Phoenix iGPU on `amdgpu`). LightDM, Xorg and XFCE are replaced by sway 1.12 running only the dashboard.
+  - **Compositor: sway.** It's GPU accelerated: wlroots' GLES2 renderer on radeonsi. Its config can turn Xwayland off (`xwayland disable`) and set the output mode (1920×1080@60), and it implements `wlr-output-power-management` for standby. cage is smaller, but it can't do the first two from its config. The config ([`deploy/sway.conf`](deploy/sway.conf)) has no bar, no key bindings, no borders and no wallpaper (`swaybg_command -`). Ctrl+Alt+F*n* still switches to a text console.
+  - **No X11 anywhere.** Xwayland isn't installed and is disabled in the config. The binary is built with Slint's `backend-winit-wayland` only. Standby uses `wlopm` and dimming draws an overlay, so the app never runs `xset` or `xrandr`. The only X11 code left in the binary is arboard's clipboard, which nothing calls.
+  - **Session:** a system unit runs sway as the desktop user on tty7, with a logind session through PAM (`pam_systemd`). That session gives sway the GPU and the input devices, and libseat switches to the VT itself. `Restart=always`. No greeter or display manager is involved.
+  - **Startup:** sway's `exec` imports `WAYLAND_DISPLAY` into the user manager and restarts `hermes-beaver.service`. Sway splits commands at `;` even after `exec`, so the steps are chained with `&&`. `sway --validate` doesn't see deferred commands.
+  - **Fullscreen:** sway fullscreens the window with a rule on the app_id `hermes-beaver`. The app's own request loses a race: Slint follows sway's first configure, which comes before the window maps and isn't fullscreen yet, and withdraws the request.
+  - **Measured on the target** (PSS): sway 95 MB, almost all of it the radeonsi driver; the dashboard 26 MB. Its RSS is about 38 MB, 16 MB of which are the two shared frame buffers that Xorg used to hold. The OpenGL renderer works on Wayland too, at about 108 MB RSS.

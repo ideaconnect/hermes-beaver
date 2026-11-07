@@ -1,12 +1,13 @@
 [Unit]
 Description=hermes-beaver dashboard for Hermes Agent
 Documentation=https://github.com/ideaconnect/hermes-beaver
-# Started by the XFCE autostart entry, which first imports DISPLAY/XAUTHORITY
-# into the user manager (see hermes-beaver-autostart.desktop).
+# Started by the kiosk's sway (see sway.conf), which first imports WAYLAND_DISPLAY
+# into the user manager.
 
 [Service]
 ExecStart=%h/.local/bin/hermes-beaver
-Restart=on-failure
+# Always: on the kiosk there's nothing else on screen, so quitting (q, Esc) restarts it too.
+Restart=always
 RestartSec=5
 # SIGTERM ends the event loop cleanly so the monitor brightness is restored.
 KillSignal=SIGTERM

@@ -1,9 +1,9 @@
 //! Screen brightness: dim when idle, brighten for a while when something happens.
 //!
 //! The monitor backlight is driven over DDC/CI with `ddcutil` (what Windows and
-//! KDE do for external monitors). Without DDC the whole picture is dimmed with
-//! RandR gamma (`xrandr --brightness`). Commands run on a background thread,
-//! because one DDC write takes 60-400 ms.
+//! KDE do for external monitors). Without DDC the dashboard dims itself with a
+//! black overlay, which on the kiosk is the whole picture. Commands run on a
+//! background thread, because one DDC write takes 60-400 ms.
 
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -84,55 +84,41 @@ impl Backend for Ddc {
     }
 }
 
-/// Whole-picture dimming through the RandR gamma ramp.
-pub struct Gamma {
-    output: String,
+/// Dims the picture with a black overlay drawn by the dashboard itself, for
+/// monitors without DDC/CI. Needs nothing from the compositor.
+pub struct Dim {
+    set_overlay: Box<dyn Fn(f32) + Send>,
 }
 
-impl Gamma {
-    pub fn probe() -> Result<Self> {
-        let out = Command::new("xrandr")
-            .arg("--query")
-            .stderr(Stdio::null())
-            .output()
-            .context("running xrandr")?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let Some(output) = text
-            .lines()
-            .find(|l| l.contains(" connected"))
-            .and_then(|l| l.split_whitespace().next())
-        else {
-            bail!("xrandr shows no connected output");
-        };
-        Ok(Self {
-            output: output.to_owned(),
-        })
+impl Dim {
+    /// `set_overlay` gets the overlay's opacity (0 = clear) and is called on the
+    /// brightness thread.
+    pub fn new(set_overlay: impl Fn(f32) + Send + 'static) -> Self {
+        Self {
+            set_overlay: Box::new(set_overlay),
+        }
     }
 }
 
-impl Backend for Gamma {
+impl Backend for Dim {
     fn name(&self) -> String {
-        format!("gamma on {}", self.output)
+        "an overlay (no DDC/CI)".into()
     }
 
     fn set(&mut self, level: u8) -> Result<()> {
-        let factor = format!("{:.2}", level.clamp(5, 100) as f32 / 100.0);
-        let ok = Command::new("xrandr")
-            .args(["--output", &self.output, "--brightness", &factor])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?
-            .success();
-        if !ok {
-            bail!("xrandr --brightness failed");
-        }
+        (self.set_overlay)(overlay_opacity(level));
         Ok(())
     }
 
-    /// Leave the desktop at normal brightness.
+    /// The window is closing: nothing to restore.
     fn exit(&mut self, _exit_level: u8) -> Result<()> {
-        self.set(100)
+        Ok(())
     }
+}
+
+/// The overlay for a brightness level: clear at 100, never darker than level 5.
+pub fn overlay_opacity(level: u8) -> f32 {
+    1.0 - f32::from(level.clamp(5, 100)) / 100.0
 }
 
 /// Parses the first `I2C bus:  /dev/i2c-N` from `ddcutil detect --brief`.
@@ -145,7 +131,7 @@ pub fn parse_detect_bus(text: &str) -> Option<u32> {
 }
 
 /// Picks a backend for the configured method, logging why others were skipped.
-pub fn select(method: BrightnessMethod) -> Option<Box<dyn Backend>> {
+pub fn select(method: BrightnessMethod, dim: Dim) -> Option<Box<dyn Backend>> {
     let ddc = || match Ddc::probe() {
         Ok(d) => Some(Box::new(d) as Box<dyn Backend>),
         Err(e) => {
@@ -153,18 +139,11 @@ pub fn select(method: BrightnessMethod) -> Option<Box<dyn Backend>> {
             None
         }
     };
-    let gamma = || match Gamma::probe() {
-        Ok(g) => Some(Box::new(g) as Box<dyn Backend>),
-        Err(e) => {
-            eprintln!("hermes-beaver: gamma dimming unavailable: {e:#}");
-            None
-        }
-    };
     match method {
         BrightnessMethod::Off => None,
         BrightnessMethod::Ddc => ddc(),
-        BrightnessMethod::Gamma => gamma(),
-        BrightnessMethod::Auto => ddc().or_else(gamma),
+        BrightnessMethod::Dim => Some(Box::new(dim)),
+        BrightnessMethod::Auto => ddc().or_else(|| Some(Box::new(dim))),
     }
 }
 
@@ -307,6 +286,23 @@ mod tests {
         let text = "Display 1\n   I2C bus:  /dev/i2c-6\n   DRM connector:  card0-HDMI-A-1\n   Monitor:  DEL:DELL G3223Q:XYZ\n";
         assert_eq!(parse_detect_bus(text), Some(6));
         assert_eq!(parse_detect_bus("No displays found.\n"), None);
+    }
+
+    #[test]
+    fn overlay_darkens_as_the_level_drops() {
+        assert_eq!(overlay_opacity(100), 0.0);
+        assert!((overlay_opacity(20) - 0.8).abs() < 1e-6);
+        assert_eq!(overlay_opacity(0), overlay_opacity(5));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s2 = seen.clone();
+        let mut dim = Dim::new(move |o| s2.lock().unwrap().push(o));
+        dim.set(100).unwrap();
+        dim.exit(80).unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![0.0],
+            "exit leaves the closing window alone"
+        );
     }
 
     #[test]
