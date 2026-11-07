@@ -9,7 +9,7 @@ A lightweight, full-screen dashboard that runs next to [Hermes Agent](https://gi
 - a red banner when Hermes itself is unhealthy;
 - a clock with ticking seconds, so you can tell at a glance that the screen isn't frozen.
 
-It dims the monitor backlight over DDC/CI when nothing is happening, and brightens it for a minute when something changes. The monitor goes into standby on a daily schedule (e.g. 23:00 to 09:00) and whenever you tell Hermes you're going to sleep or out (`/sleep`, `/awake`). Vacation mode (`/vacation`) keeps it off until you turn it back on. A key press or mouse move on the dashboard machine also wakes it, until ten minutes pass without input.
+It dims the monitor backlight over DDC/CI (`ddcutil`, which talks to the monitor over the cable, whatever the display server) when nothing is happening, and brightens it for a minute when something changes. The monitor goes into standby on a daily schedule (e.g. 23:00 to 09:00) and whenever you tell Hermes you're going to sleep or out (`/sleep`, `/awake`). Vacation mode (`/vacation`) keeps it off until you turn it back on. A key press or mouse move on the dashboard machine also wakes it, until ten minutes pass without input.
 
 Written in Rust with [Slint](https://slint.dev): one binary of about 17 MB that idles at about 0% CPU and about 40 MB RSS (16 MB of it are the two frame buffers it shares with the compositor). It's a Wayland client. On the host it runs in a kiosk session: [sway](https://swaywm.org) with no bar, no menus and no Xwayland, rendering on the GPU. Hermes reports its work over MCP (see [MCP.md](MCP.md)). [PLAN.md](PLAN.md) has the design; the [project board](https://github.com/orgs/ideaconnect/projects/7) tracks progress.
 
@@ -50,7 +50,7 @@ make deploy
 - replaces the display manager with the kiosk session: [`hermes-beaver-kiosk.service`](deploy/hermes-beaver-kiosk.service) runs sway on tty7 as the desktop user. LightDM is disabled and masked, so no X server starts. Sway starts the dashboard;
 - restarts sway only when its config changed, otherwise just the dashboard.
 
-Run it again at any time; it's idempotent. To go back to X: `systemctl disable --now hermes-beaver-kiosk && systemctl unmask lightdm && systemctl enable --now lightdm` (and deploy a build with Slint's `backend-winit-x11`). When a release adds MCP tools, send `/reload-mcp` to Hermes afterwards so the model sees them.
+Run it again at any time; it's idempotent. To go back to X: `systemctl disable --now hermes-beaver-kiosk && systemctl unmask lightdm && systemctl enable --now lightdm`, after reinstalling LightDM and a desktop if you removed them, and deploy a build with Slint's `backend-winit-x11`. When a release adds MCP tools, send `/reload-mcp` to Hermes afterwards so the model sees them.
 
 To connect Hermes, give [BOBER.md](BOBER.md) to the agent: it lists the changes to make on the Hermes side.
 
@@ -71,7 +71,7 @@ stale_after_mins = 30        # Telegram/CLI tasks without updates show "stale?"
 finished_rows = 8
 
 [brightness]
-method = "auto"              # auto (DDC/CI, else dim) | ddc | dim (dark overlay) | off
+method = "auto"              # auto: DDC/CI, else a dark overlay | ddc: DDC/CI only | dim | off
 idle = 20
 active = 80
 active_secs = 60

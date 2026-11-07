@@ -204,7 +204,7 @@ A `ref` resolves to the most recent unfinished task with that ref. Writers use W
 - **Startup detection:**
   - `method = auto`: run `ddcutil detect --brief`, cache the bus number, then read VCP `0x10`. On success use DDC; otherwise use dim.
   - The Dell's on-screen menu must have DDC/CI enabled. The detection message tells you if it isn't.
-- **DDC:** `ddcutil --bus N --noverify setvcp 10 <level>`. Fade 20→80 in 3 steps over about 1 s. Each event causes about 2 writes, which protects the monitor's EEPROM.
+- **DDC:** `ddcutil --bus N --noverify setvcp 10 <level>`. It goes over the cable's I2C channel (`/dev/i2c-N`), independent of X or Wayland. The startup probe retries every 5 s for a minute, because a monitor may not answer right after boot or a mode set; stopping the dashboard cuts the wait short. Fade 20→80 in 3 steps over about 1 s. Each event causes about 2 writes, which protects the monitor's EEPROM.
 - **Dim:** a black overlay drawn by the dashboard itself, with opacity `1 − level/100`. It needs nothing from the compositor. (Under X this was `xrandr --brightness`, and `gamma` still parses as its name.)
 - **Controller:**
   - A new wake event sets the level to active and restarts the timer.

@@ -220,7 +220,7 @@ impl App {
                 });
                 app.brightness = Some(Controller::start(
                     Levels::from(&config.brightness),
-                    move || brightness::select(method, dim),
+                    move |pause| brightness::select(method, dim, pause),
                 ));
                 app.screen = Some(Screen::new(Box::new(display::OutputPower)));
                 app

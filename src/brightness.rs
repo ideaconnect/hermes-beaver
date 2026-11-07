@@ -1,8 +1,11 @@
 //! Screen brightness: dim when idle, brighten for a while when something happens.
 //!
 //! The monitor backlight is driven over DDC/CI with `ddcutil` (what Windows and
-//! KDE do for external monitors). Without DDC the dashboard dims itself with a
-//! black overlay, which on the kiosk is the whole picture. Commands run on a
+//! KDE do for external monitors). It talks to the monitor over the cable's I2C
+//! channel (`/dev/i2c-N`), so it doesn't care which display server runs. A monitor
+//! may not answer yet right after boot or a mode set, so the probe retries for a
+//! minute. Only for monitors without DDC the dashboard dims itself with a black
+//! overlay (`method = "dim"`, or `auto` once DDC gave up). Commands run on a
 //! background thread, because one DDC write takes 60-400 ms.
 
 use std::process::{Command, Stdio};
@@ -130,9 +133,16 @@ pub fn parse_detect_bus(text: &str) -> Option<u32> {
         .and_then(|n| n.trim().parse().ok())
 }
 
+/// Waits between probes on the brightness thread. Returns `false` when the
+/// controller is stopping: give up at once.
+pub type Pause<'a> = &'a mut dyn FnMut(Duration) -> bool;
+
+const DDC_TRIES: u32 = 12;
+const DDC_RETRY: Duration = Duration::from_secs(5);
+
 /// Picks a backend for the configured method, logging why others were skipped.
-pub fn select(method: BrightnessMethod, dim: Dim) -> Option<Box<dyn Backend>> {
-    let ddc = || match Ddc::probe() {
+pub fn select(method: BrightnessMethod, dim: Dim, pause: Pause) -> Option<Box<dyn Backend>> {
+    let mut ddc = || match patiently(DDC_TRIES, DDC_RETRY, pause, Ddc::probe) {
         Ok(d) => Some(Box::new(d) as Box<dyn Backend>),
         Err(e) => {
             eprintln!("hermes-beaver: DDC/CI unavailable: {e:#}");
@@ -145,6 +155,45 @@ pub fn select(method: BrightnessMethod, dim: Dim) -> Option<Box<dyn Backend>> {
         BrightnessMethod::Dim => Some(Box::new(dim)),
         BrightnessMethod::Auto => ddc().or_else(|| Some(Box::new(dim))),
     }
+}
+
+/// Runs `probe` up to `tries` times, `every` apart, until it succeeds. Gives up at
+/// once when a program is missing (waiting won't install it) or when `pause` says
+/// the controller is stopping.
+fn patiently<T>(
+    tries: u32,
+    every: Duration,
+    pause: Pause,
+    mut probe: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let mut attempt = 1;
+    loop {
+        let e = match probe() {
+            Ok(v) => {
+                if attempt > 1 {
+                    eprintln!("hermes-beaver: DDC/CI answered on try {attempt}");
+                }
+                return Ok(v);
+            }
+            Err(e) if attempt >= tries || missing_program(&e) => return Err(e),
+            Err(e) => e,
+        };
+        if attempt == 1 {
+            let secs = every.as_secs() * u64::from(tries - 1);
+            eprintln!("hermes-beaver: DDC/CI not answering yet ({e:#}); retrying for {secs} s");
+        }
+        if !pause(every) {
+            return Err(e.context("stopped while waiting"));
+        }
+        attempt += 1;
+    }
+}
+
+fn missing_program(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 enum Msg {
@@ -181,23 +230,48 @@ pub struct Controller {
 
 impl Controller {
     /// `backend` is created on the worker thread, so slow probing never blocks the UI.
+    /// It gets a [`Pause`] to wait between probes; stopping the controller cuts it short.
     pub fn start(
         levels: Levels,
-        backend: impl FnOnce() -> Option<Box<dyn Backend>> + Send + 'static,
+        backend: impl FnOnce(Pause) -> Option<Box<dyn Backend>> + Send + 'static,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         let handle = std::thread::Builder::new()
             .name("brightness".into())
             .spawn(move || {
-                let Some(mut backend) = backend() else {
+                // Wakes that arrive while probing are kept for afterwards.
+                let (mut woken, mut stopping) = (false, false);
+                let mut pause = |d: Duration| {
+                    let until = Instant::now() + d;
+                    loop {
+                        match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                            Ok(Msg::Wake) => woken = true,
+                            Err(RecvTimeoutError::Timeout) => return true,
+                            Ok(Msg::Exit) | Err(RecvTimeoutError::Disconnected) => {
+                                stopping = true;
+                                return false;
+                            }
+                        }
+                    }
+                };
+                let found = backend(&mut pause);
+                let Some(mut backend) = found else {
                     // Drain messages until exit so senders never fail loudly.
-                    while let Ok(Msg::Wake) = rx.recv() {}
+                    while !stopping && let Ok(Msg::Wake) = rx.recv() {}
                     return;
                 };
+                if stopping {
+                    return;
+                }
                 eprintln!("hermes-beaver: brightness via {}", backend.name());
                 let mut level = levels.idle;
                 apply(&mut *backend, level);
                 let mut active_until: Option<Instant> = None;
+                if woken {
+                    fade(&mut *backend, level, levels.active, levels.step_pause);
+                    level = levels.active;
+                    active_until = Some(Instant::now() + levels.active_for);
+                }
                 loop {
                     let msg = match active_until {
                         Some(t) => rx.recv_timeout(t.saturating_duration_since(Instant::now())),
@@ -316,7 +390,10 @@ mod tests {
             step_pause: Duration::from_millis(1),
         };
         let l2 = log.clone();
-        let c = Controller::start(levels, move || Some(Box::new(Fake(l2)) as Box<dyn Backend>));
+        let c = Controller::start(
+            levels,
+            move |_| Some(Box::new(Fake(l2)) as Box<dyn Backend>),
+        );
         std::thread::sleep(Duration::from_millis(30));
         c.wake();
         std::thread::sleep(Duration::from_millis(60));
@@ -324,6 +401,84 @@ mod tests {
         std::thread::sleep(Duration::from_millis(400));
         drop(c);
         assert_eq!(*log.lock().unwrap(), vec![20, 40, 60, 80, 60, 40, 20, 90]);
+    }
+
+    #[test]
+    fn probing_retries_then_gives_up() {
+        let (mut tries, mut pauses) = (0, 0);
+        let mut pause = |_: Duration| {
+            pauses += 1;
+            true
+        };
+        let found = patiently(5, Duration::ZERO, &mut pause, || {
+            tries += 1;
+            if tries < 3 {
+                bail!("not yet")
+            } else {
+                Ok(tries)
+            }
+        });
+        assert_eq!(found.unwrap(), 3);
+        assert_eq!(pauses, 2);
+
+        let mut pause = |_: Duration| true;
+        let mut tries = 0;
+        let r: Result<()> = patiently(4, Duration::ZERO, &mut pause, || {
+            tries += 1;
+            bail!("never")
+        });
+        assert_eq!((r.is_err(), tries), (true, 4));
+    }
+
+    #[test]
+    fn probing_stops_for_missing_programs_and_shutdown() {
+        let mut pauses = 0;
+        let mut pause = |_: Duration| {
+            pauses += 1;
+            true
+        };
+        let r: Result<()> = patiently(12, Duration::ZERO, &mut pause, || {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound)).context("running ddcutil")
+        });
+        assert!(r.is_err());
+        assert_eq!(pauses, 0, "waiting won't install ddcutil");
+
+        let mut tries = 0;
+        let mut stop = |_: Duration| false;
+        let r: Result<()> = patiently(12, Duration::ZERO, &mut stop, || {
+            tries += 1;
+            bail!("not yet")
+        });
+        assert_eq!((r.is_err(), tries), (true, 1));
+    }
+
+    #[test]
+    fn a_slow_probe_keeps_wakes_and_yields_to_exit() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let levels = Levels {
+            idle: 20,
+            active: 80,
+            exit: 90,
+            active_for: Duration::from_millis(100),
+            step_pause: Duration::from_millis(1),
+        };
+        let l2 = log.clone();
+        let c = Controller::start(levels, move |pause| {
+            pause(Duration::from_millis(80)).then(|| Box::new(Fake(l2)) as Box<dyn Backend>)
+        });
+        c.wake(); // during the probe
+        std::thread::sleep(Duration::from_millis(400));
+        drop(c);
+        assert_eq!(*log.lock().unwrap(), vec![20, 40, 60, 80, 60, 40, 20, 90]);
+
+        // Stopping in the middle of a long probe returns at once.
+        let t = Instant::now();
+        let c = Controller::start(levels, |pause| {
+            pause(Duration::from_secs(60));
+            None
+        });
+        drop(c);
+        assert!(t.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
@@ -336,7 +491,7 @@ mod tests {
                 active_for: Duration::from_secs(1),
                 step_pause: Duration::ZERO,
             },
-            || None,
+            |_| None,
         );
         c.wake();
         drop(c);
