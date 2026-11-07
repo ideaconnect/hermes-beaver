@@ -21,11 +21,12 @@ kiosk_sum() { { cat /etc/systemd/system/$KIOSK /etc/pam.d/hermes-beaver-kiosk \
     "$USER_HOME/.config/hermes-beaver/sway.conf" "$USER_HOME"/.config/hermes-beaver/sway.d/*.conf \
     2>/dev/null || true; } | sha256sum; }
 
-step "System packages: ddcutil (brightness over DDC/CI), sway (Wayland compositor), wlopm (monitor standby)"
+step "System packages: ddcutil (brightness over DDC/CI), sway (Wayland compositor), wlopm (monitor standby), kbd (chvt)"
 PKGS=()
 command -v ddcutil >/dev/null || PKGS+=(ddcutil)
 command -v sway >/dev/null || PKGS+=(sway)
 command -v wlopm >/dev/null || PKGS+=(wlopm)
+command -v chvt >/dev/null || PKGS+=(kbd)
 # No recommends: they bring Xwayland, swaybg, swayidle, swaylock and a terminal.
 if [ ${#PKGS[@]} -eq 0 ]; then echo "already installed"
 else DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "${PKGS[@]}"; fi

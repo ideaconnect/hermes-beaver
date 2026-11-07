@@ -25,6 +25,14 @@ StandardOutput=journal
 StandardError=journal
 UtmpIdentifier=tty7
 UtmpMode=user
+# At boot the GPU driver (amdgpu) can still be replacing the firmware framebuffer
+# (simpledrm): sway would find a card that doesn't open yet and give up. Wait until udev
+# has set up the devices; later restarts don't wait. (-: carry on after a timeout.)
+ExecStartPre=-/usr/bin/udevadm settle --timeout=30
+# Bring tty7 to the front, as a display manager would: the console boots on tty1, and
+# sway waits for its session to become active, which happens only while tty7 shows.
+# Without this sway times out after 10 s and the unit restarts forever. (+: as root.)
+ExecStartPre=+/usr/bin/chvt 7
 ExecStart=/usr/bin/sway --config @HOME@/.config/hermes-beaver/sway.conf
 Restart=always
 RestartSec=3
