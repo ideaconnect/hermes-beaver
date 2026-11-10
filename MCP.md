@@ -97,7 +97,7 @@ The dashboard may have a daily schedule in its own config, for example off at 23
 - `display_on` lasts until the next scheduled switch off;
 - vacation mode ignores the schedule and lasts until `display_on`.
 
-New tasks never wake the monitor. Requests take effect within 10 seconds. These calls aren't tasks: don't call `task_start` for them.
+New tasks never wake the monitor. Requests take effect within 10 seconds. A repeated request applies its state again, even when `changed` is `false`: `display_on` wakes a monitor that stayed dark. These calls aren't tasks: don't call `task_start` for them.
 
 Every display tool returns the same result:
 
@@ -110,7 +110,7 @@ Every display tool returns the same result:
 | `display` | `on` or `off`: what the monitor does now |
 | `until` | When that changes by itself, in the dashboard's local time; `null` if only a request will change it. Use it when you confirm to the owner. |
 | `vacation` | Whether vacation mode is on |
-| `changed` | Whether the monitor switches because of this call |
+| `changed` | Whether the wanted state changes because of this call (a repeated request is applied again either way) |
 
 ### `display_off`
 

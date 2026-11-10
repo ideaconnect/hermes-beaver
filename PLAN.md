@@ -384,6 +384,8 @@ Spike results and implementation details that changed the plan above:
   - **Switching** happens on the GUI's tick, through the compositor (originally X DPMS; see *Wayland kiosk* below):
     - `wlopm --off '*'` puts the monitor into standby, and `wlopm --on '*'` wakes it.
     - Checked on the target: the HDMI connector's DPMS goes Off and On, and DDC/CI still answers in standby.
+    - The result counts, not the exit code (issue #33): `wlopm --on '*'` succeeds when there is no output, and sway keeps the power mode by output name, so after an `off` an output that reconnects comes up in standby. After each switch, and every 60 s, the dashboard reads `wlopm -j` and switches the outputs in the wrong mode; until at least one output exists (for `on`) and all of them follow, it tries again on every tick. Problems are logged when they change, not on every tick.
+    - A new request applies its state again even when the wanted state stays the same (its `since` moved), so `display_on` fixes a dark screen.
     - A key press or pointer move wakes it without changing the request. After 600 s without input it goes back into standby; that was the X DPMS default timeout. The key that wakes the monitor does nothing else, so an Esc doesn't also quit.
   - **Brightness:** in standby, events don't trigger the brightness boost. Waking gives the usual active minute.
   - **Restarts:** a restart re-applies standby. Stopping the dashboard wakes the monitor.
