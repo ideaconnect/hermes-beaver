@@ -311,11 +311,13 @@ impl App {
     }
 
     /// Puts the monitor into standby or wakes it, following the owner's last request
-    /// and the daily schedule.
+    /// and the daily schedule. A new request applies its state again even when the
+    /// wanted state doesn't change, so `display_on` wakes a monitor that stayed dark.
     fn sync_screen(&mut self, now: i64) -> Change {
-        let want_off = display::wants_off(&self.snapshot.display, &self.schedule, now);
+        let req = &self.snapshot.display;
+        let want_off = display::wants_off(req, &self.schedule, now);
         match &mut self.screen {
-            Some(s) => s.sync(want_off, now),
+            Some(s) => s.sync(want_off, req.since, now),
             None => Change::None,
         }
     }

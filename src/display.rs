@@ -15,14 +15,32 @@
 //! puts every output into standby and `wlopm --on '*'` wakes them. The compositor
 //! never blanks the dashboard on its own: the kiosk session runs no idle daemon.
 //!
+//! A switch counts as done only when `wlopm -j` shows it: at least one output (none
+//! is fine for standby) and every output in the wanted mode. Until then every sync
+//! (the 10 s tick) tries again; afterwards the outputs are checked every
+//! [`RECHECK_SECS`], and an output in the wrong mode is switched back. The exit code
+//! alone can't be trusted, for two reasons:
+//! - `wlopm --on '*'` switches the outputs present and succeeds when there are none,
+//!   for example while the monitor is briefly off the cable;
+//! - sway keeps the requested power mode by output name, so after `--off` an output
+//!   that reconnects under that name comes up in standby until an `on` reaches it.
+//!
+//! Together they can leave the monitor dark after the morning switch-on while the
+//! dashboard believes it is on (issue #33).
+//!
+//! A new request from the owner applies its state again even when the wanted state
+//! stays the same: `display_on` wakes a monitor that stayed dark.
+//!
 //! A key press or pointer move wakes a monitor in standby without changing the
 //! requested state. After [`INPUT_WAKE_SECS`] without input it goes back into
-//! standby (the X DPMS timeout the dashboard had before Wayland).
+//! standby (the X DPMS timeout the dashboard had before Wayland). The checks leave a
+//! monitor woken this way on.
 
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Days, Local, NaiveTime, TimeZone};
+use serde::Deserialize;
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -174,36 +192,82 @@ pub fn describe(reply: &Value, now: DateTime<Local>) -> String {
     format!("Screen {state} until {when}.")
 }
 
+/// One output as the compositor reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Output {
+    pub name: String,
+    pub on: bool,
+}
+
 pub trait Power {
-    fn set_on(&mut self, on: bool) -> Result<()>;
+    /// Switches the output called `output`, or every output present with `"*"`.
+    fn set_on(&mut self, output: &str, on: bool) -> Result<()>;
+    /// The outputs the compositor has now, and whether each is on.
+    fn outputs(&mut self) -> Result<Vec<Output>>;
 }
 
 /// Output power through the compositor, with `wlopm` (package wlopm).
 pub struct OutputPower;
 
 impl Power for OutputPower {
-    fn set_on(&mut self, on: bool) -> Result<()> {
+    fn set_on(&mut self, output: &str, on: bool) -> Result<()> {
         let flag = if on { "--on" } else { "--off" };
-        let out = Command::new("wlopm")
-            .args([flag, "*"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .context("running wlopm (is it installed?)")?;
-        if !out.status.success() {
-            bail!(
-                "wlopm {flag} failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+        let out = wlopm(&[flag, output])?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // A refused switch or an unknown output name is an ERROR line with exit code 0.
+        if !out.status.success() || stderr.lines().any(|l| l.starts_with("ERROR")) {
+            bail!("wlopm {flag} {output} failed: {}", stderr.trim());
         }
         Ok(())
     }
+
+    fn outputs(&mut self) -> Result<Vec<Output>> {
+        let out = wlopm(&["-j"])?;
+        if !out.status.success() {
+            bail!(
+                "wlopm -j failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        parse_outputs(&out.stdout)
+    }
+}
+
+fn wlopm(args: &[&str]) -> Result<std::process::Output> {
+    Command::new("wlopm")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .context("running wlopm (is it installed?)")
+}
+
+/// Reads `wlopm -j`: `[{"output": "HDMI-A-1", "power-mode": "on"}, ...]`.
+fn parse_outputs(json: &[u8]) -> Result<Vec<Output>> {
+    #[derive(Deserialize)]
+    struct Entry {
+        output: String,
+        #[serde(rename = "power-mode")]
+        mode: String,
+    }
+    let entries: Vec<Entry> = serde_json::from_slice(json).context("reading wlopm -j")?;
+    Ok(entries
+        .into_iter()
+        .map(|e| Output {
+            on: e.mode == "on",
+            name: e.output,
+        })
+        .collect())
 }
 
 /// How long a monitor woken by input stays on without further input while it
 /// should be in standby.
 pub const INPUT_WAKE_SECS: i64 = 600;
 
+/// How often the outputs are checked while they are in the wanted mode. Until they
+/// are, every sync checks and switches again.
+pub const RECHECK_SECS: i64 = 60;
+
+/// What a sync did to the monitor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
     None,
@@ -211,22 +275,44 @@ pub enum Change {
     TurnedOn,
 }
 
-/// Applies the requested state whenever it changes. Dropping it turns the
+/// Applies the wanted state and keeps the outputs in it. Dropping it turns the
 /// monitor back on, so stopping the dashboard never leaves a dark screen.
 pub struct Screen {
     power: Box<dyn Power>,
-    /// Last applied state, `Some(true)` = off. `None` before the first sync.
+    log: Box<dyn FnMut(String)>,
+    /// The wanted state, `Some(true)` = off. `None` before the first sync.
     off: Option<bool>,
+    /// When the owner made the request applied last (`Request::since`).
+    asked: Option<i64>,
     /// Woken by input while it should be off: the time of the last input.
     woken: Option<i64>,
+    /// The outputs were in the wanted mode at the last check.
+    settled: bool,
+    /// When the outputs were last checked.
+    checked: Option<i64>,
+    /// The output names the last successful check read; `None` before one.
+    seen: Option<Vec<String>>,
+    /// The problem logged last, so one that lasts is logged once.
+    problem: Option<String>,
 }
 
 impl Screen {
+    /// Logs to stderr, that is the journal.
     pub fn new(power: Box<dyn Power>) -> Self {
+        Self::with_log(power, Box::new(|line| eprintln!("hermes-beaver: {line}")))
+    }
+
+    pub fn with_log(power: Box<dyn Power>, log: Box<dyn FnMut(String)>) -> Self {
         Self {
             power,
+            log,
             off: None,
+            asked: None,
             woken: None,
+            settled: false,
+            checked: None,
+            seen: None,
+            problem: None,
         }
     }
 
@@ -244,54 +330,177 @@ impl Screen {
         let woke = self.woken.is_none();
         self.woken = Some(now);
         if woke {
-            match self.power.set_on(true) {
-                Ok(()) => eprintln!("hermes-beaver: monitor on (input)"),
-                Err(e) => eprintln!("hermes-beaver: waking the monitor failed: {e:#}"),
-            }
+            self.switch_all(now, Some("monitor on (input)"));
         }
         woke
     }
 
-    /// The first call applies the state either way: after a restart the monitor
-    /// may still be in standby from the previous run. A monitor woken by input goes
-    /// back into standby after [`INPUT_WAKE_SECS`] without input.
-    pub fn sync(&mut self, want_off: bool, now: i64) -> Change {
-        if self.off == Some(want_off) {
-            if !self.woken.is_some_and(|last| now - last >= INPUT_WAKE_SECS) {
-                return Change::None;
-            }
+    /// Applies `want_off` when it changes, when the owner asked again (`asked`, the
+    /// time of their latest request, moved) and at the first call: after a restart the
+    /// monitor may still be in standby from the previous run. In between it checks the
+    /// outputs every [`RECHECK_SECS`], or at every call until they follow, and switches
+    /// those in the wrong mode. A monitor woken by input goes back into standby after
+    /// [`INPUT_WAKE_SECS`] without input.
+    pub fn sync(&mut self, want_off: bool, asked: i64, now: i64) -> Change {
+        let first = self.off.is_none();
+        let again = self.asked.is_some_and(|a| a != asked);
+        self.asked = Some(asked);
+        if first || again || self.off != Some(want_off) {
+            self.off = Some(want_off);
             self.woken = None;
-            match self.power.set_on(false) {
-                Ok(()) => eprintln!("hermes-beaver: monitor off again (no input)"),
-                Err(e) => eprintln!("hermes-beaver: switching the monitor failed: {e:#}"),
-            }
+            return match (want_off, first) {
+                (true, _) => {
+                    self.switch_all(now, Some("monitor off (standby)"));
+                    Change::TurnedOff
+                }
+                // Startup: on, as it was; only a problem is worth a line.
+                (false, true) => {
+                    self.switch_all(now, None);
+                    Change::None
+                }
+                (false, false) => {
+                    self.switch_all(now, Some("monitor on"));
+                    Change::TurnedOn
+                }
+            };
+        }
+        if self.woken.is_some_and(|last| now - last >= INPUT_WAKE_SECS) {
+            self.woken = None;
+            self.switch_all(now, Some("monitor off again (no input)"));
             return Change::TurnedOff;
         }
-        self.woken = None;
-        let first = self.off.is_none();
-        match self.power.set_on(!want_off) {
-            Ok(()) if want_off => eprintln!("hermes-beaver: monitor off (standby)"),
-            Ok(()) if !first => eprintln!("hermes-beaver: monitor on"),
-            Ok(()) => {}
-            Err(e) => eprintln!("hermes-beaver: switching the monitor failed: {e:#}"),
+        if self.settled && self.checked.is_some_and(|t| now - t < RECHECK_SECS) {
+            return Change::None;
         }
-        // Marked as applied even after a failure: retrying every tick would
-        // only repeat the error. The next requested change tries again.
-        self.off = Some(want_off);
-        match (want_off, first) {
-            (true, _) => Change::TurnedOff,
-            (false, true) => Change::None,
-            (false, false) => Change::TurnedOn,
+        self.reconcile(now)
+    }
+
+    /// Switches every output to the wanted mode and checks that they follow.
+    fn switch_all(&mut self, now: i64, done: Option<&str>) {
+        let on = !self.is_off();
+        let result = self
+            .power
+            .set_on("*", on)
+            .and_then(|()| self.power.outputs());
+        self.settle(result, now, done);
+    }
+
+    /// Checks the outputs and switches those in the wrong mode. Reports a change when
+    /// they follow again after a switch or a problem.
+    fn reconcile(&mut self, now: i64) -> Change {
+        let on = !self.is_off();
+        let outputs = match self.power.outputs() {
+            Ok(outputs) => outputs,
+            Err(e) => {
+                self.settle(Err(e), now, None);
+                return Change::None;
+            }
+        };
+        let wrong: Vec<String> = outputs
+            .iter()
+            .filter(|o| o.on != on)
+            .map(|o| o.name.clone())
+            .collect();
+        if wrong.is_empty() && self.problem.is_none() {
+            self.settle(Ok(outputs), now, None);
+            return Change::None;
         }
+        // For the log line: outputs missing at the last check came back since.
+        let notes: Vec<String> = outputs
+            .iter()
+            .filter_map(|o| {
+                let back = self
+                    .seen
+                    .as_ref()
+                    .is_some_and(|seen| !seen.contains(&o.name));
+                Some(match (on, o.on == on, back) {
+                    (true, _, true) => format!("{} came back", o.name),
+                    (true, false, false) => format!("{} was off", o.name),
+                    (false, false, true) => format!("{} came back on", o.name),
+                    (false, false, false) => format!("{} was on", o.name),
+                    _ => return None,
+                })
+            })
+            .collect();
+        let detail = match (notes.is_empty(), outputs.is_empty()) {
+            (false, _) => notes.join(", "),
+            (true, false) => outputs
+                .iter()
+                .map(|o| o.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            (true, true) => "no outputs".to_owned(),
+        };
+        let done = format!("monitor {} ({detail})", if on { "on" } else { "off" });
+        let result = if wrong.is_empty() {
+            Ok(outputs)
+        } else {
+            wrong
+                .iter()
+                .try_for_each(|name| self.power.set_on(name, on))
+                .and_then(|()| self.power.outputs())
+        };
+        match (self.settle(result, now, Some(&done)), on) {
+            (false, _) => Change::None,
+            (true, true) => Change::TurnedOn,
+            (true, false) => Change::TurnedOff,
+        }
+    }
+
+    /// Records a check. It settles when there is an output (none is fine for standby)
+    /// and every output is in the wanted mode; then `done` is logged. A problem is
+    /// logged only when it differs from the one logged last. Returns whether it settled.
+    fn settle(&mut self, result: Result<Vec<Output>>, now: i64, done: Option<&str>) -> bool {
+        let on = !self.is_off();
+        let state = if on { "on" } else { "off" };
+        self.checked = Some(now);
+        let problem = match result {
+            Err(e) => Some(format!("monitor {state}: {e:#}, retrying")),
+            Ok(outputs) => {
+                let wrong: Vec<&str> = outputs
+                    .iter()
+                    .filter(|o| o.on != on)
+                    .map(|o| o.name.as_str())
+                    .collect();
+                let problem = if !wrong.is_empty() {
+                    let other = if on { "off" } else { "on" };
+                    Some(format!(
+                        "monitor {state}: {} still {other}, retrying",
+                        wrong.join(", ")
+                    ))
+                } else if on && outputs.is_empty() {
+                    Some("monitor on: no outputs yet, retrying".to_owned())
+                } else {
+                    None
+                };
+                self.seen = Some(outputs.into_iter().map(|o| o.name).collect());
+                problem
+            }
+        };
+        self.settled = problem.is_none();
+        match problem {
+            Some(p) if self.problem.as_ref() != Some(&p) => {
+                (self.log)(p.clone());
+                self.problem = Some(p);
+            }
+            Some(_) => {}
+            None => {
+                self.problem = None;
+                if let Some(line) = done {
+                    (self.log)(line.to_owned());
+                }
+            }
+        }
+        self.settled
     }
 }
 
 impl Drop for Screen {
     fn drop(&mut self) {
         if self.is_off()
-            && let Err(e) = self.power.set_on(true)
+            && let Err(e) = self.power.set_on("*", true)
         {
-            eprintln!("hermes-beaver: turning the monitor back on failed: {e:#}");
+            (self.log)(format!("turning the monitor back on failed: {e:#}"));
         }
     }
 }
@@ -302,18 +511,106 @@ mod tests {
 
     use super::*;
 
-    struct Fake(Arc<Mutex<Vec<bool>>>);
+    const HDMI: &str = "HDMI-A-1";
+
+    /// A compositor whose outputs can come and go.
+    #[derive(Default)]
+    struct Sim {
+        /// The outputs present, and whether each is on.
+        outputs: Vec<(&'static str, bool)>,
+        /// Every switch asked for, e.g. "off *" or "on HDMI-A-1".
+        switches: Vec<String>,
+        reads: usize,
+        /// Switching fails with this error.
+        broken: Option<&'static str>,
+        /// Reading the outputs fails.
+        blind: bool,
+    }
+
+    struct Fake(Arc<Mutex<Sim>>);
 
     impl Power for Fake {
-        fn set_on(&mut self, on: bool) -> Result<()> {
-            self.0.lock().unwrap().push(on);
+        fn set_on(&mut self, output: &str, on: bool) -> Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.switches
+                .push(format!("{} {output}", if on { "on" } else { "off" }));
+            if let Some(e) = s.broken {
+                bail!(e);
+            }
+            for o in s.outputs.iter_mut() {
+                if output == "*" || o.0 == output {
+                    o.1 = on;
+                }
+            }
             Ok(())
+        }
+
+        fn outputs(&mut self) -> Result<Vec<Output>> {
+            let mut s = self.0.lock().unwrap();
+            if s.blind {
+                bail!("no Wayland display");
+            }
+            s.reads += 1;
+            Ok(s.outputs
+                .iter()
+                .map(|&(name, on)| Output {
+                    name: name.into(),
+                    on,
+                })
+                .collect())
         }
     }
 
-    fn screen() -> (Screen, Arc<Mutex<Vec<bool>>>) {
+    /// The fake compositor and the log lines, seen from the test.
+    struct Rig {
+        sim: Arc<Mutex<Sim>>,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Rig {
+        fn set(&self, outputs: &[(&'static str, bool)]) {
+            self.sim.lock().unwrap().outputs = outputs.to_vec();
+        }
+
+        fn outputs(&self) -> Vec<(&'static str, bool)> {
+            self.sim.lock().unwrap().outputs.clone()
+        }
+
+        fn switches(&self) -> Vec<String> {
+            self.sim.lock().unwrap().switches.clone()
+        }
+
+        fn reads(&self) -> usize {
+            self.sim.lock().unwrap().reads
+        }
+
+        fn break_with(&self, error: Option<&'static str>) {
+            self.sim.lock().unwrap().broken = error;
+        }
+
+        fn blind(&self, blind: bool) {
+            self.sim.lock().unwrap().blind = blind;
+        }
+
+        /// The lines logged since the last call.
+        fn take_log(&self) -> Vec<String> {
+            std::mem::take(&mut *self.log.lock().unwrap())
+        }
+    }
+
+    /// A screen with one output, on.
+    fn screen() -> (Screen, Rig) {
+        let sim = Arc::new(Mutex::new(Sim {
+            outputs: vec![(HDMI, true)],
+            ..Sim::default()
+        }));
         let log = Arc::new(Mutex::new(Vec::new()));
-        (Screen::new(Box::new(Fake(log.clone()))), log)
+        let sink = log.clone();
+        let s = Screen::with_log(
+            Box::new(Fake(sim.clone())),
+            Box::new(move |line| sink.lock().unwrap().push(line)),
+        );
+        (s, Rig { sim, log })
     }
 
     /// 2030-01-`day` `hh`:`mm` in the local time zone (January: no DST change nearby).
@@ -457,71 +754,232 @@ mod tests {
 
     #[test]
     fn applies_only_changes_and_restores_on_drop() {
-        let (mut s, log) = screen();
+        let (mut s, rig) = screen();
         assert_eq!(
-            s.sync(false, 0),
+            s.sync(false, 0, 0),
             Change::None,
             "startup: on, nothing to report"
         );
-        assert_eq!(s.sync(false, 0), Change::None);
-        assert_eq!(s.sync(true, 0), Change::TurnedOff);
+        assert_eq!(s.sync(false, 0, 0), Change::None);
+        assert_eq!(s.sync(true, 0, 0), Change::TurnedOff);
         assert!(s.is_off());
-        assert_eq!(s.sync(true, 0), Change::None);
-        assert_eq!(s.sync(false, 0), Change::TurnedOn);
-        assert_eq!(s.sync(true, 0), Change::TurnedOff);
+        assert_eq!(s.sync(true, 0, 0), Change::None);
+        assert_eq!(s.sync(false, 0, 0), Change::TurnedOn);
+        assert_eq!(s.sync(true, 0, 0), Change::TurnedOff);
         drop(s);
-        assert_eq!(*log.lock().unwrap(), vec![true, false, true, false, true]);
+        assert_eq!(rig.switches(), ["on *", "off *", "on *", "off *", "on *"]);
+        assert_eq!(
+            rig.take_log(),
+            [
+                "monitor off (standby)",
+                "monitor on",
+                "monitor off (standby)"
+            ]
+        );
     }
 
     #[test]
     fn starting_while_asleep_turns_it_off() {
-        let (mut s, log) = screen();
-        assert_eq!(s.sync(true, 0), Change::TurnedOff);
-        assert_eq!(*log.lock().unwrap(), vec![false]);
+        let (mut s, rig) = screen();
+        assert_eq!(s.sync(true, 0, 0), Change::TurnedOff);
+        assert_eq!(rig.switches(), ["off *"]);
     }
 
     #[test]
-    fn failures_are_not_retried_every_tick() {
-        struct Broken(u32);
-        impl Power for Broken {
-            fn set_on(&mut self, _: bool) -> Result<()> {
-                self.0 += 1;
-                bail!("no compositor")
-            }
+    fn on_with_no_outputs_is_retried_until_one_appears() {
+        let (mut s, rig) = screen();
+        s.sync(true, 0, 0);
+        // The monitor drops off HDMI in standby: nothing lit, nothing to do.
+        rig.set(&[]);
+        assert_eq!(s.sync(true, 0, RECHECK_SECS), Change::None);
+        rig.take_log();
+        // The morning switch: `wlopm --on '*'` succeeds and switches nothing.
+        assert_eq!(s.sync(false, 0, 100), Change::TurnedOn);
+        assert_eq!(rig.take_log(), ["monitor on: no outputs yet, retrying"]);
+        assert_eq!(s.sync(false, 0, 110), Change::None);
+        assert!(rig.take_log().is_empty(), "the same problem is logged once");
+        // It reconnects in standby (sway keeps `power off` for its name).
+        rig.set(&[(HDMI, false)]);
+        assert_eq!(s.sync(false, 0, 120), Change::TurnedOn);
+        assert_eq!(rig.take_log(), ["monitor on (HDMI-A-1 came back)"]);
+        assert_eq!(rig.outputs(), [(HDMI, true)]);
+        assert_eq!(rig.switches(), ["off *", "on *", "on HDMI-A-1"]);
+        // Settled: checked again only after RECHECK_SECS.
+        let reads = rig.reads();
+        assert_eq!(s.sync(false, 0, 120 + RECHECK_SECS - 1), Change::None);
+        assert_eq!(rig.reads(), reads);
+        assert_eq!(s.sync(false, 0, 120 + RECHECK_SECS), Change::None);
+        assert_eq!(rig.reads(), reads + 1);
+        assert!(rig.take_log().is_empty());
+    }
+
+    #[test]
+    fn outputs_in_the_wrong_mode_are_switched_back() {
+        let (mut s, rig) = screen();
+        s.sync(false, 0, 0);
+        // Reconnected in standby between two checks.
+        rig.set(&[(HDMI, false)]);
+        assert_eq!(s.sync(false, 0, RECHECK_SECS), Change::TurnedOn);
+        assert_eq!(rig.take_log(), ["monitor on (HDMI-A-1 was off)"]);
+        // At night, one that comes back on goes back into standby.
+        s.sync(true, 0, 1000);
+        rig.set(&[(HDMI, true)]);
+        assert_eq!(s.sync(true, 0, 1000 + RECHECK_SECS), Change::TurnedOff);
+        assert_eq!(
+            rig.take_log(),
+            ["monitor off (standby)", "monitor off (HDMI-A-1 was on)"]
+        );
+        assert_eq!(rig.outputs(), [(HDMI, false)]);
+        // Also when it was missing at the last check.
+        rig.set(&[]);
+        assert_eq!(s.sync(true, 0, 1000 + 2 * RECHECK_SECS), Change::None);
+        rig.set(&[(HDMI, true)]);
+        assert_eq!(s.sync(true, 0, 1000 + 3 * RECHECK_SECS), Change::TurnedOff);
+        assert_eq!(rig.take_log(), ["monitor off (HDMI-A-1 came back on)"]);
+        assert_eq!(
+            rig.switches(),
+            [
+                "on *",
+                "on HDMI-A-1",
+                "off *",
+                "off HDMI-A-1",
+                "off HDMI-A-1"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_input_wake_is_not_undone_by_the_checks() {
+        let (mut s, rig) = screen();
+        s.sync(true, 0, 0);
+        assert!(s.input(100));
+        // Switched off behind its back while awake: woken on purpose, so back on.
+        rig.set(&[(HDMI, false)]);
+        assert_eq!(s.sync(true, 0, 100 + RECHECK_SECS), Change::TurnedOn);
+        let reads = rig.reads();
+        for t in (170..100 + INPUT_WAKE_SECS).step_by(10) {
+            assert_eq!(s.sync(true, 0, t), Change::None, "at {t}");
         }
-        let mut s = Screen::new(Box::new(Broken(0)));
-        assert_eq!(s.sync(true, 0), Change::TurnedOff);
-        assert_eq!(s.sync(true, 0), Change::None);
+        assert!(rig.reads() > reads, "checked while awake");
+        assert_eq!(rig.outputs(), [(HDMI, true)]);
+        assert_eq!(s.sync(true, 0, 100 + INPUT_WAKE_SECS), Change::TurnedOff);
+        assert!(s.is_off());
+        assert_eq!(rig.switches(), ["off *", "on *", "on HDMI-A-1", "off *"]);
+    }
+
+    #[test]
+    fn a_repeated_request_applies_its_state_again() {
+        let (mut s, rig) = screen();
+        s.sync(false, 0, 0);
+        // Dark while the dashboard believes it's on.
+        rig.set(&[(HDMI, false)]);
+        // `display_on` while on: a newer request, the same wanted state.
+        assert_eq!(s.sync(false, 5, 10), Change::TurnedOn);
+        assert_eq!(rig.outputs(), [(HDMI, true)]);
+        assert_eq!(s.sync(false, 5, 20), Change::None, "the same request");
+        // `display_off` during an input wake ends the wake.
+        s.sync(true, 5, 30);
+        assert!(s.input(40));
+        assert_eq!(s.sync(true, 50, 50), Change::TurnedOff);
+        assert!(s.is_off());
+        assert_eq!(rig.switches(), ["on *", "on *", "off *", "on *", "off *"]);
+    }
+
+    #[test]
+    fn a_failing_switch_is_retried_and_logged_when_its_result_changes() {
+        let (mut s, rig) = screen();
+        rig.break_with(Some("no compositor"));
+        assert_eq!(s.sync(true, 0, 0), Change::TurnedOff);
+        assert_eq!(s.sync(true, 0, 10), Change::None);
+        assert_eq!(s.sync(true, 0, 20), Change::None);
+        assert_eq!(rig.switches(), ["off *", "off HDMI-A-1", "off HDMI-A-1"]);
+        assert_eq!(rig.take_log(), ["monitor off: no compositor, retrying"]);
+        rig.break_with(Some("output busy"));
+        s.sync(true, 0, 30);
+        s.sync(true, 0, 40);
+        assert_eq!(rig.take_log(), ["monitor off: output busy, retrying"]);
+        // Fixed: the next sync settles it and says so, then it stops switching.
+        rig.break_with(None);
+        assert_eq!(s.sync(true, 0, 50), Change::TurnedOff);
+        assert_eq!(rig.take_log(), ["monitor off (HDMI-A-1 was on)"]);
+        assert_eq!(s.sync(true, 0, 60), Change::None);
+        assert_eq!(rig.switches().len(), 6);
+        assert_eq!(rig.outputs(), [(HDMI, false)]);
+    }
+
+    #[test]
+    fn a_failing_check_is_logged_once_and_its_end_too() {
+        let (mut s, rig) = screen();
+        s.sync(false, 0, 0);
+        rig.blind(true);
+        assert_eq!(s.sync(false, 0, RECHECK_SECS), Change::None);
+        assert_eq!(s.sync(false, 0, RECHECK_SECS + 10), Change::None);
+        assert_eq!(rig.take_log(), ["monitor on: no Wayland display, retrying"]);
+        rig.blind(false);
+        assert_eq!(s.sync(false, 0, RECHECK_SECS + 20), Change::TurnedOn);
+        assert_eq!(rig.take_log(), ["monitor on (HDMI-A-1)"]);
+        assert_eq!(rig.switches(), ["on *"], "nothing needed switching");
     }
 
     #[test]
     fn input_wakes_standby_until_a_quiet_spell() {
-        let (mut s, log) = screen();
+        let (mut s, rig) = screen();
         assert!(!s.input(0), "already on: nothing to wake");
-        assert_eq!(s.sync(true, 0), Change::TurnedOff);
+        assert_eq!(s.sync(true, 0, 0), Change::TurnedOff);
         assert!(s.input(100), "woke the monitor");
         assert!(!s.is_off());
         assert!(!s.input(200), "already awake");
         // Each input restarts the quiet spell.
-        assert_eq!(s.sync(true, 200 + INPUT_WAKE_SECS - 1), Change::None);
-        assert_eq!(s.sync(true, 200 + INPUT_WAKE_SECS), Change::TurnedOff);
+        assert_eq!(s.sync(true, 0, 200 + INPUT_WAKE_SECS - 1), Change::None);
+        assert_eq!(s.sync(true, 0, 200 + INPUT_WAKE_SECS), Change::TurnedOff);
         assert!(s.is_off());
-        assert_eq!(s.sync(true, 200 + 2 * INPUT_WAKE_SECS), Change::None);
-        assert_eq!(*log.lock().unwrap(), vec![false, true, false]);
+        assert_eq!(s.sync(true, 0, 200 + 2 * INPUT_WAKE_SECS), Change::None);
+        assert_eq!(rig.switches(), ["off *", "on *", "off *"]);
+        assert_eq!(
+            rig.take_log(),
+            [
+                "monitor off (standby)",
+                "monitor on (input)",
+                "monitor off again (no input)"
+            ]
+        );
     }
 
     #[test]
     fn a_requested_change_ends_an_input_wake() {
-        let (mut s, log) = screen();
-        s.sync(true, 0);
+        let (mut s, rig) = screen();
+        s.sync(true, 0, 0);
         s.input(10);
-        assert_eq!(s.sync(false, 20), Change::TurnedOn);
+        assert_eq!(s.sync(false, 0, 20), Change::TurnedOn);
         // Off again later: input wakes it again, the quiet spell starts afresh.
-        assert_eq!(s.sync(true, 30), Change::TurnedOff);
-        assert_eq!(s.sync(true, 30 + INPUT_WAKE_SECS), Change::None);
+        assert_eq!(s.sync(true, 0, 30), Change::TurnedOff);
+        assert_eq!(s.sync(true, 0, 30 + INPUT_WAKE_SECS), Change::None);
         assert!(s.input(40));
         drop(s);
         // Dropping an input-woken screen doesn't switch it again: it's on.
-        assert_eq!(*log.lock().unwrap(), vec![false, true, true, false, true]);
+        assert_eq!(rig.switches(), ["off *", "on *", "on *", "off *", "on *"]);
+    }
+
+    #[test]
+    fn reads_wlopm_json() {
+        // As wlopm 1.0.0 prints it on the dashboard host.
+        let one = b"[\n  {\n    \"output\": \"HDMI-A-1\",\n    \"power-mode\": \"on\"\n  }\n]\n";
+        let out = |name: &str, on| Output {
+            name: name.into(),
+            on,
+        };
+        assert_eq!(parse_outputs(one).unwrap(), [out("HDMI-A-1", true)]);
+        // No outputs: an empty list.
+        assert_eq!(parse_outputs(b"[\n]\n").unwrap(), Vec::<Output>::new());
+        let two = br#"[
+  {"output": "DP-1", "power-mode": "off"},
+  {"output": "HDMI-A-1", "power-mode": "on"}
+]"#;
+        assert_eq!(
+            parse_outputs(two).unwrap(),
+            [out("DP-1", false), out("HDMI-A-1", true)]
+        );
+        assert!(parse_outputs(b"").is_err());
+        assert!(parse_outputs(b"HDMI-A-1 on\n").is_err());
     }
 }
