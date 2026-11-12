@@ -8,6 +8,7 @@ mod mcp;
 mod metrics;
 mod reconcile;
 mod store;
+mod sway;
 mod tools;
 mod ui;
 

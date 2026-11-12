@@ -45,7 +45,7 @@ make deploy
 ```
 
 `make deploy` builds a release locally, copies it to the host, and runs [`deploy/install.sh`](deploy/install.sh) there as root. The script:
-- installs `sway`, `ddcutil` (brightness) and `wlopm` (standby), without recommended packages, so no Xwayland;
+- installs `sway` and `ddcutil` (brightness), without recommended packages, so no Xwayland. Standby goes through sway's IPC socket;
 - installs the binary, its systemd user unit, and the sway config [`deploy/sway.conf`](deploy/sway.conf) plus the host's `secrets/sway.conf` (outputs and modes);
 - replaces the display manager with the kiosk session: [`hermes-beaver-kiosk.service`](deploy/hermes-beaver-kiosk.service) runs sway on tty7 as the desktop user. LightDM is disabled and masked, so no X server starts. Sway starts the dashboard;
 - restarts sway only when its config changed, otherwise just the dashboard.

@@ -222,7 +222,13 @@ impl App {
                     Levels::from(&config.brightness),
                     move |pause| brightness::select(method, dim, pause),
                 ));
-                app.screen = Some(Screen::new(Box::new(display::OutputPower)));
+                app.screen = match display::SwayPower::from_env() {
+                    Ok(power) => Some(Screen::new(Box::new(power))),
+                    Err(e) => {
+                        eprintln!("hermes-beaver: no monitor standby: {e:#}");
+                        None
+                    }
+                };
                 app
             }
             Mode::Demo(scenario) => {

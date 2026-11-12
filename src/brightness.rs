@@ -26,6 +26,21 @@ pub trait Backend: Send {
     }
 }
 
+/// Why a ddcutil run failed. It reports errors on stdout, among its traces, and
+/// often leaves stderr empty: the last line of either, stderr first.
+fn failure_reason(out: &std::process::Output) -> String {
+    let last_line = |b: &[u8]| {
+        String::from_utf8_lossy(b)
+            .lines()
+            .map(str::trim)
+            .rfind(|l| !l.is_empty())
+            .map(str::to_owned)
+    };
+    last_line(&out.stderr)
+        .or_else(|| last_line(&out.stdout))
+        .unwrap_or_else(|| format!("no output ({})", out.status))
+}
+
 /// Monitor backlight over DDC/CI.
 pub struct Ddc {
     bus: u32,
@@ -65,7 +80,7 @@ impl Backend for Ddc {
 
     fn set(&mut self, level: u8) -> Result<()> {
         // --skip-ddc-checks: the startup probe already verified DDC, and it cuts a
-        // write from ~410 ms to ~60 ms. ddcutil prints traces on stdout: ignore it.
+        // write from ~410 ms to ~60 ms.
         let out = Command::new("ddcutil")
             .args([
                 "--bus",
@@ -74,14 +89,11 @@ impl Backend for Ddc {
                 "--skip-ddc-checks",
             ])
             .args(["setvcp", "10", &level.min(100).to_string()])
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()?;
         if !out.status.success() {
-            bail!(
-                "ddcutil setvcp failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+            bail!("ddcutil setvcp failed: {}", failure_reason(&out));
         }
         Ok(())
     }

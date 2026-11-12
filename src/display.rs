@@ -10,20 +10,26 @@
 //! an `off` with `until` holds until that time even across a scheduled switch on,
 //! and vacation holds until `display_on`.
 //!
-//! The monitor is switched through the Wayland compositor with `wlopm` (the
-//! wlr-output-power-management protocol, which sway implements): `wlopm --off '*'`
-//! puts every output into standby and `wlopm --on '*'` wakes them. The compositor
-//! never blanks the dashboard on its own: the kiosk session runs no idle daemon.
+//! The monitor is switched through sway's IPC socket: `output * power off` puts
+//! every output into standby and `output * power on` wakes them, as `swaymsg` would.
+//! Not `wlopm` (wlr-output-power-management): that protocol addresses a
+//! `wl_output`, and sway 1.12 can withdraw the `wl_output` of an output it powered
+//! off, after which nothing can wake it that way. Sway's own command addresses the
+//! output by name in its config, so it works in any state, including an output that
+//! was unplugged and came back while off. Because a switch can still fail to stick,
+//! the actual state is read back every [`VERIFY_SECS`] and applied again if it
+//! drifted. The compositor never blanks the dashboard on its own: the kiosk session
+//! runs no idle daemon.
 //!
 //! A key press or pointer move wakes a monitor in standby without changing the
 //! requested state. After [`INPUT_WAKE_SECS`] without input it goes back into
 //! standby (the X DPMS timeout the dashboard had before Wayland).
 
-use std::process::{Command, Stdio};
-
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use chrono::{DateTime, Days, Local, NaiveTime, TimeZone};
 use serde_json::Value;
+
+use crate::sway::Sway;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Mode {
@@ -176,33 +182,44 @@ pub fn describe(reply: &Value, now: DateTime<Local>) -> String {
 
 pub trait Power {
     fn set_on(&mut self, on: bool) -> Result<()>;
+    /// Whether each output is powered on now. Empty when there's none (unplugged).
+    fn powered(&mut self) -> Result<Vec<bool>>;
 }
 
-/// Output power through the compositor, with `wlopm` (package wlopm).
-pub struct OutputPower;
+/// Output power through sway's IPC.
+pub struct SwayPower(Sway);
 
-impl Power for OutputPower {
+impl SwayPower {
+    pub fn from_env() -> Result<Self> {
+        Sway::from_env().map(Self)
+    }
+}
+
+impl Power for SwayPower {
     fn set_on(&mut self, on: bool) -> Result<()> {
-        let flag = if on { "--on" } else { "--off" };
-        let out = Command::new("wlopm")
-            .args([flag, "*"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .context("running wlopm (is it installed?)")?;
-        if !out.status.success() {
-            bail!(
-                "wlopm {flag} failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(())
+        self.0.run(if on {
+            "output * power on"
+        } else {
+            "output * power off"
+        })
+    }
+
+    fn powered(&mut self) -> Result<Vec<bool>> {
+        Ok(self
+            .0
+            .output_power()?
+            .into_iter()
+            .map(|(_, on)| on)
+            .collect())
     }
 }
 
 /// How long a monitor woken by input stays on without further input while it
 /// should be in standby.
 pub const INPUT_WAKE_SECS: i64 = 600;
+
+/// How often the outputs' actual power is compared with the state applied last.
+pub const VERIFY_SECS: i64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
@@ -219,6 +236,10 @@ pub struct Screen {
     off: Option<bool>,
     /// Woken by input while it should be off: the time of the last input.
     woken: Option<i64>,
+    /// When the outputs' actual power was last read back (or a switch was made).
+    checked: Option<i64>,
+    /// A drift was reported and hasn't cleared yet: retry without logging again.
+    drifting: bool,
 }
 
 impl Screen {
@@ -227,6 +248,8 @@ impl Screen {
             power,
             off: None,
             woken: None,
+            checked: None,
+            drifting: false,
         }
     }
 
@@ -258,9 +281,12 @@ impl Screen {
     pub fn sync(&mut self, want_off: bool, now: i64) -> Change {
         if self.off == Some(want_off) {
             if !self.woken.is_some_and(|last| now - last >= INPUT_WAKE_SECS) {
+                self.verify(now);
                 return Change::None;
             }
             self.woken = None;
+            self.checked = Some(now);
+            self.drifting = false;
             match self.power.set_on(false) {
                 Ok(()) => eprintln!("hermes-beaver: monitor off again (no input)"),
                 Err(e) => eprintln!("hermes-beaver: switching the monitor failed: {e:#}"),
@@ -276,12 +302,60 @@ impl Screen {
             Err(e) => eprintln!("hermes-beaver: switching the monitor failed: {e:#}"),
         }
         // Marked as applied even after a failure: retrying every tick would
-        // only repeat the error. The next requested change tries again.
+        // only repeat the error. `verify` tries again in a minute.
         self.off = Some(want_off);
+        // Sway applies a switch after the command returns: read it back later.
+        self.checked = Some(now);
+        // A new state: an earlier drift is no longer the question.
+        self.drifting = false;
         match (want_off, first) {
             (true, _) => Change::TurnedOff,
             (false, true) => Change::None,
             (false, false) => Change::TurnedOn,
+        }
+    }
+
+    /// Every [`VERIFY_SECS`]: if an output isn't in the state applied last (an input
+    /// wake counts as on), applies it again. Logs when a drift starts and ends, not
+    /// at every retry.
+    fn verify(&mut self, now: i64) {
+        if self.checked.is_some_and(|t| now - t < VERIFY_SECS) {
+            return;
+        }
+        self.checked = Some(now);
+        let Some(off) = self.off else { return };
+        let want_on = !off || self.woken.is_some();
+        let word = |on: bool| if on { "on" } else { "off" };
+        let powered = match self.power.powered() {
+            Ok(p) => p,
+            Err(e) => {
+                if !self.drifting {
+                    eprintln!("hermes-beaver: reading the monitor's state failed: {e:#}");
+                    self.drifting = true;
+                }
+                return;
+            }
+        };
+        if powered.iter().all(|&on| on == want_on) {
+            if self.drifting {
+                eprintln!("hermes-beaver: monitor {} as it should be", word(want_on));
+                self.drifting = false;
+            }
+            return;
+        }
+        let fresh = !self.drifting;
+        if fresh {
+            eprintln!(
+                "hermes-beaver: monitor should be {} but is {}: switching it again",
+                word(want_on),
+                word(!want_on)
+            );
+            self.drifting = true;
+        }
+        if let Err(e) = self.power.set_on(want_on)
+            && fresh
+        {
+            eprintln!("hermes-beaver: switching the monitor failed: {e:#}");
         }
     }
 }
@@ -302,18 +376,41 @@ mod tests {
 
     use super::*;
 
-    struct Fake(Arc<Mutex<Vec<bool>>>);
+    /// What the fake compositor saw and shows.
+    #[derive(Default)]
+    struct Outputs {
+        /// Every `set_on`, in order.
+        calls: Vec<bool>,
+        /// Each output's power; none by default.
+        power: Vec<bool>,
+        /// Switches don't stick (the sway 1.12 `wl_output` case).
+        stuck: bool,
+    }
+
+    struct Fake(Arc<Mutex<Outputs>>);
 
     impl Power for Fake {
         fn set_on(&mut self, on: bool) -> Result<()> {
-            self.0.lock().unwrap().push(on);
+            let mut o = self.0.lock().unwrap();
+            o.calls.push(on);
+            if !o.stuck {
+                o.power.iter_mut().for_each(|p| *p = on);
+            }
             Ok(())
+        }
+
+        fn powered(&mut self) -> Result<Vec<bool>> {
+            Ok(self.0.lock().unwrap().power.clone())
         }
     }
 
-    fn screen() -> (Screen, Arc<Mutex<Vec<bool>>>) {
-        let log = Arc::new(Mutex::new(Vec::new()));
-        (Screen::new(Box::new(Fake(log.clone()))), log)
+    fn screen() -> (Screen, Arc<Mutex<Outputs>>) {
+        let outputs = Arc::new(Mutex::new(Outputs::default()));
+        (Screen::new(Box::new(Fake(outputs.clone()))), outputs)
+    }
+
+    fn calls(o: &Arc<Mutex<Outputs>>) -> Vec<bool> {
+        o.lock().unwrap().calls.clone()
     }
 
     /// 2030-01-`day` `hh`:`mm` in the local time zone (January: no DST change nearby).
@@ -470,14 +567,14 @@ mod tests {
         assert_eq!(s.sync(false, 0), Change::TurnedOn);
         assert_eq!(s.sync(true, 0), Change::TurnedOff);
         drop(s);
-        assert_eq!(*log.lock().unwrap(), vec![true, false, true, false, true]);
+        assert_eq!(calls(&log), vec![true, false, true, false, true]);
     }
 
     #[test]
     fn starting_while_asleep_turns_it_off() {
         let (mut s, log) = screen();
         assert_eq!(s.sync(true, 0), Change::TurnedOff);
-        assert_eq!(*log.lock().unwrap(), vec![false]);
+        assert_eq!(calls(&log), vec![false]);
     }
 
     #[test]
@@ -486,7 +583,10 @@ mod tests {
         impl Power for Broken {
             fn set_on(&mut self, _: bool) -> Result<()> {
                 self.0 += 1;
-                bail!("no compositor")
+                anyhow::bail!("no compositor")
+            }
+            fn powered(&mut self) -> Result<Vec<bool>> {
+                anyhow::bail!("no compositor")
             }
         }
         let mut s = Screen::new(Box::new(Broken(0)));
@@ -507,7 +607,7 @@ mod tests {
         assert_eq!(s.sync(true, 200 + INPUT_WAKE_SECS), Change::TurnedOff);
         assert!(s.is_off());
         assert_eq!(s.sync(true, 200 + 2 * INPUT_WAKE_SECS), Change::None);
-        assert_eq!(*log.lock().unwrap(), vec![false, true, false]);
+        assert_eq!(calls(&log), vec![false, true, false]);
     }
 
     #[test]
@@ -522,6 +622,87 @@ mod tests {
         assert!(s.input(40));
         drop(s);
         // Dropping an input-woken screen doesn't switch it again: it's on.
-        assert_eq!(*log.lock().unwrap(), vec![false, true, true, false, true]);
+        assert_eq!(calls(&log), vec![false, true, true, false, true]);
+    }
+
+    #[test]
+    fn a_switch_that_didnt_stick_is_made_again_every_minute() {
+        let (mut s, log) = screen();
+        log.lock().unwrap().power = vec![true];
+        s.sync(false, 0);
+        assert_eq!(s.sync(true, 10), Change::TurnedOff);
+        // The morning switch doesn't reach the monitor.
+        log.lock().unwrap().stuck = true;
+        assert_eq!(s.sync(false, 100), Change::TurnedOn);
+        assert_eq!(s.sync(false, 100 + VERIFY_SECS - 1), Change::None);
+        assert_eq!(calls(&log), vec![true, false, true], "too early to check");
+        s.sync(false, 100 + VERIFY_SECS);
+        assert_eq!(
+            calls(&log),
+            vec![true, false, true, true],
+            "read back off: on again"
+        );
+        s.sync(false, 100 + 2 * VERIFY_SECS);
+        assert_eq!(
+            calls(&log).len(),
+            5,
+            "still off: once a minute, not every tick"
+        );
+        log.lock().unwrap().stuck = false;
+        s.sync(false, 100 + 3 * VERIFY_SECS);
+        assert_eq!(log.lock().unwrap().power, vec![true]);
+        s.sync(false, 100 + 4 * VERIFY_SECS);
+        assert_eq!(
+            calls(&log).len(),
+            6,
+            "on as it should be: nothing more to do"
+        );
+        assert!(!s.drifting);
+    }
+
+    #[test]
+    fn a_requested_change_starts_without_an_old_drift() {
+        let (mut s, log) = screen();
+        log.lock().unwrap().power = vec![true];
+        s.sync(false, 0);
+        log.lock().unwrap().power = vec![false];
+        s.sync(false, VERIFY_SECS);
+        assert!(s.drifting, "reported");
+        assert_eq!(s.sync(true, VERIFY_SECS + 1), Change::TurnedOff);
+        assert!(!s.drifting, "the next drift is reported afresh");
+    }
+
+    #[test]
+    fn a_monitor_that_came_back_on_by_itself_goes_off_again() {
+        let (mut s, log) = screen();
+        log.lock().unwrap().power = vec![true];
+        s.sync(true, 0);
+        log.lock().unwrap().power = vec![true];
+        s.sync(true, VERIFY_SECS);
+        assert_eq!(calls(&log), vec![false, false]);
+        assert_eq!(log.lock().unwrap().power, vec![false]);
+    }
+
+    #[test]
+    fn checking_leaves_an_input_wake_alone() {
+        let (mut s, log) = screen();
+        log.lock().unwrap().power = vec![true];
+        s.sync(true, 0);
+        assert!(s.input(10));
+        assert_eq!(s.sync(true, 10 + VERIFY_SECS), Change::None);
+        assert_eq!(
+            calls(&log),
+            vec![false, true],
+            "woken and on: nothing to fix"
+        );
+    }
+
+    #[test]
+    fn no_outputs_means_nothing_to_fix() {
+        let (mut s, log) = screen();
+        s.sync(false, 0);
+        s.sync(true, 1);
+        s.sync(true, 1 + 5 * VERIFY_SECS);
+        assert_eq!(calls(&log), vec![true, false]);
     }
 }
