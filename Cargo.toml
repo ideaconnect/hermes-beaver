@@ -24,6 +24,10 @@ slint = { version = "1.18.1", default-features = false, features = [
     "renderer-software",
 ] }
 toml = "1.1.8"
+# Input activity from the compositor (ext-idle-notify-v1) for waking the monitor by
+# mouse. The same versions winit already uses: no new crates.
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", default-features = false, features = ["client", "staging"] }
 
 [build-dependencies]
 slint-build = "1.18.1"

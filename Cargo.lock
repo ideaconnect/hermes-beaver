@@ -1617,6 +1617,8 @@ dependencies = [
  "slint",
  "slint-build",
  "toml",
+ "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]

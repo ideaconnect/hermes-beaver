@@ -3,6 +3,7 @@ mod config;
 mod display;
 mod health;
 mod hermes;
+mod idle;
 mod mask;
 mod mcp;
 mod metrics;

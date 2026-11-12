@@ -113,6 +113,19 @@ pub fn run(
             woke
         }
     });
+    // With the outputs off the window gets keys but no pointer events: the
+    // compositor's idle notifications cover the mouse.
+    if app.borrow().screen.is_some() {
+        let weak = window.as_weak();
+        let started = crate::idle::watch(move || {
+            let _ = weak.upgrade_in_event_loop(|w| {
+                w.invoke_user_input();
+            });
+        });
+        if let Err(e) = started {
+            eprintln!("hermes-beaver: the mouse won't wake the monitor: {e:#}");
+        }
+    }
 
     // First metrics shortly after start, then every 10 s.
     let tick = {

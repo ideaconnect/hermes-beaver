@@ -23,7 +23,10 @@
 //!
 //! A key press or pointer move wakes a monitor in standby without changing the
 //! requested state. After [`INPUT_WAKE_SECS`] without input it goes back into
-//! standby (the X DPMS timeout the dashboard had before Wayland).
+//! standby (the X DPMS timeout the dashboard had before Wayland). Keys reach the
+//! window, which keeps the focus while the outputs are off; the pointer doesn't
+//! (the window is on no output then), so the compositor's idle notifications
+//! report it (see `idle.rs`).
 
 use anyhow::Result;
 use chrono::{DateTime, Days, Local, NaiveTime, TimeZone};
@@ -221,6 +224,11 @@ pub const INPUT_WAKE_SECS: i64 = 600;
 /// How often the outputs' actual power is compared with the state applied last.
 pub const VERIFY_SECS: i64 = 60;
 
+/// Inputs this soon after the one that woke the monitor belong to the same
+/// gesture: a key that arrives just after the compositor reported the activity
+/// still does nothing else (Esc would quit).
+const WAKE_GESTURE_SECS: i64 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
     None,
@@ -236,6 +244,8 @@ pub struct Screen {
     off: Option<bool>,
     /// Woken by input while it should be off: the time of the last input.
     woken: Option<i64>,
+    /// When input last woke it.
+    woke_at: Option<i64>,
     /// When the outputs' actual power was last read back (or a switch was made).
     checked: Option<i64>,
     /// A drift was reported and hasn't cleared yet: retry without logging again.
@@ -248,6 +258,7 @@ impl Screen {
             power,
             off: None,
             woken: None,
+            woke_at: None,
             checked: None,
             drifting: false,
         }
@@ -259,7 +270,8 @@ impl Screen {
     }
 
     /// A key press or pointer move at `now`. Wakes a monitor in standby; the requested
-    /// state doesn't change. Returns whether this input woke it.
+    /// state doesn't change. Returns whether this input woke it, or came within
+    /// [`WAKE_GESTURE_SECS`] of the input that did.
     pub fn input(&mut self, now: i64) -> bool {
         if self.off != Some(true) {
             return false;
@@ -267,12 +279,13 @@ impl Screen {
         let woke = self.woken.is_none();
         self.woken = Some(now);
         if woke {
+            self.woke_at = Some(now);
             match self.power.set_on(true) {
                 Ok(()) => eprintln!("hermes-beaver: monitor on (input)"),
                 Err(e) => eprintln!("hermes-beaver: waking the monitor failed: {e:#}"),
             }
         }
-        woke
+        woke || self.woke_at.is_some_and(|t| now - t <= WAKE_GESTURE_SECS)
     }
 
     /// The first call applies the state either way: after a restart the monitor
@@ -704,5 +717,15 @@ mod tests {
         s.sync(true, 1);
         s.sync(true, 1 + 5 * VERIFY_SECS);
         assert_eq!(calls(&log), vec![true, false]);
+    }
+
+    #[test]
+    fn input_right_after_the_wake_belongs_to_it() {
+        let (mut s, log) = screen();
+        s.sync(true, 0);
+        assert!(s.input(100), "woke it");
+        assert!(s.input(101), "the key right after: swallowed too");
+        assert!(!s.input(103), "later input is ordinary input");
+        assert_eq!(calls(&log), vec![false, true], "switched on once");
     }
 }
