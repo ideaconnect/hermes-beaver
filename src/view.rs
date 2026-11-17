@@ -1,15 +1,147 @@
-//! Turns store snapshots, metrics and health into the rows the screen shows.
-//! Pure functions, so every display rule is unit-tested.
+//! Turns store snapshots, metrics and health into the rows both views show: the
+//! kiosk copies them into Slint's types, the web view serialises them to JSON.
+//! Pure functions, so every display rule is written once and unit-tested.
 
 use chrono::TimeZone;
-use slint::SharedString;
+use serde::Serialize;
 
-use super::{DoneItem, MetricItem, NeedItem, TaskItem};
-use crate::config::{Animal, UiConfig};
+use crate::config::{Animal, Config, UiConfig};
 use crate::health::Health;
 use crate::mask::mask;
 use crate::metrics::Metrics;
 use crate::store::views::{NeedKind, Snapshot, TaskRow};
+
+/// A running or queued task.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct TaskItem {
+    pub badge: String,
+    pub title: String,
+    pub meta: String,
+    pub status: String,
+    pub tone: i32,
+    /// The task's GitHub page (see [`github_link`]); only the web view shows links.
+    pub link: Option<String>,
+}
+
+/// A row of "Needs you".
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct NeedItem {
+    pub label: String,
+    pub title: String,
+    pub detail: String,
+    pub age: String,
+    pub tone: i32,
+    pub link: Option<String>,
+}
+
+/// A recently finished task.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct DoneItem {
+    pub badge: String,
+    pub title: String,
+    pub outcome: String,
+    pub age: String,
+    pub tone: i32,
+    pub link: Option<String>,
+}
+
+/// A gauge with its 30-minute sparkline.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct MetricItem {
+    pub label: String,
+    /// 0..1, the bar's fill.
+    pub value: f32,
+    pub text: String,
+    pub detail: String,
+    /// SVG path commands in a 1000x100 viewbox.
+    pub spark: String,
+    pub shown: bool,
+}
+
+/// How many rows the lists get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    /// What fits the kiosk's panels at 1080p; the rest is counted in "+N more".
+    Screen,
+    /// Every row: the web page scrolls. Finished tasks still stop at `finished_rows`.
+    All,
+}
+
+/// What the views are drawn from.
+#[derive(Clone, Default)]
+pub struct State {
+    pub snapshot: Snapshot,
+    pub health: Health,
+    pub metrics: Metrics,
+    /// Whether the machine has a GPU to show.
+    pub gpu_shown: bool,
+}
+
+/// Everything on the dashboard except the header's hostname and clock.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Dashboard {
+    /// The health banner; empty when everything is fine.
+    pub banner: String,
+    pub tasks: Vec<TaskItem>,
+    pub tasks_hint: String,
+    pub needs: Vec<NeedItem>,
+    pub needs_hint: String,
+    /// Items that need the owner, PRs waiting for review left out, as for the animal.
+    pub needs_you: usize,
+    pub done: Vec<DoneItem>,
+    pub done_hint: String,
+    pub metrics: Vec<MetricItem>,
+    pub mascot_art: String,
+    pub mascot_caption: String,
+    pub mascot_tone: i32,
+    pub counter: String,
+    pub counter_label: String,
+}
+
+/// The whole dashboard at `now`. `loadavg` is the CPU gauge's detail (see [`loadavg`]).
+pub fn dashboard(
+    s: &State,
+    config: &Config,
+    now: i64,
+    fit: Fit,
+    loadavg: Option<String>,
+) -> Dashboard {
+    let snap = &s.snapshot;
+    let stale = config.tasks.stale_after_mins as i64 * 60;
+    let (task_max, need_max) = match fit {
+        Fit::Screen => (TASK_ROWS, NEED_ROWS),
+        Fit::All => (usize::MAX, usize::MAX),
+    };
+    let (tasks, tasks_hint) = task_items(snap, now, stale, task_max);
+    let (needs, needs_hint) = need_items(snap, now, need_max);
+    let done_max = match fit {
+        Fit::Screen => done_rows(
+            needs.len(),
+            !needs_hint.is_empty(),
+            config.tasks.finished_rows,
+        ),
+        Fit::All => config.tasks.finished_rows,
+    };
+    let (done, done_hint) = done_items(snap, now, done_max);
+    let mood = mood(&s.health, snap);
+    let (mascot_caption, mascot_tone) = mascot_caption(mood, snap);
+    Dashboard {
+        banner: s.health.banner(),
+        tasks,
+        tasks_hint,
+        needs,
+        needs_hint,
+        needs_you: needs_you(snap),
+        done,
+        done_hint,
+        metrics: metric_items(&s.metrics, s.gpu_shown, loadavg),
+        mascot_art: mascot_art(config.ui.animal, mood).to_owned(),
+        mascot_caption,
+        mascot_tone,
+        counter: snap.done_count.to_string(),
+        counter_label: counter_label(snap.go_live_at),
+    }
+}
 
 // Tones (see ui/theme.slint).
 pub const WORKING: i32 = 1;
@@ -87,6 +219,25 @@ fn pr_label(url: &str) -> String {
     }
 }
 
+/// A task's GitHub page: its PR if it has one, else its issue. Only `https://github.com/`
+/// links, so a page never gets a `javascript:` or look-alike URL to follow.
+pub fn github_link(t: &TaskRow) -> Option<String> {
+    [t.pr_url.as_deref(), t.url.as_deref()]
+        .into_iter()
+        .flatten()
+        .find(|u| is_github(u))
+        .map(str::to_owned)
+}
+
+fn is_github(url: &str) -> bool {
+    url.strip_prefix("https://github.com/").is_some_and(|rest| {
+        !rest.is_empty()
+            && !rest
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '<' | '>' | '\\'))
+    })
+}
+
 fn hint_more(n: usize) -> String {
     if n == 0 {
         String::new()
@@ -111,52 +262,55 @@ fn task_item(t: &TaskRow, now: i64, stale_after_secs: i64) -> TaskItem {
     };
     TaskItem {
         badge: badge(&t.source).into(),
-        title: mask(&t.title).into(),
+        title: mask(&t.title),
         meta: join([
             t.reference.as_deref().map(mask),
             kind_label(t.kind.as_deref()),
             t.note.as_deref().map(mask),
-        ])
-        .into(),
-        status: status.into(),
+        ]),
+        status,
         tone,
+        link: github_link(t),
     }
 }
 
-/// Running tasks, then queued ones, capped to the panel; returns (rows, hint).
-pub fn task_items(snap: &Snapshot, now: i64, stale_after_secs: i64) -> (Vec<TaskItem>, String) {
+/// Running tasks, then queued ones, at most `max`; returns (rows, hint).
+pub fn task_items(
+    snap: &Snapshot,
+    now: i64,
+    stale_after_secs: i64,
+    max: usize,
+) -> (Vec<TaskItem>, String) {
     let mut rows: Vec<TaskItem> = snap
         .running
         .iter()
         .map(|t| task_item(t, now, stale_after_secs))
         .collect();
-    rows.extend(snap.queue.iter().map(|q| {
-        TaskItem {
-            badge: if q.reference.is_some() { "GH" } else { "CLI" }.into(),
-            title: mask(&q.title).into(),
-            meta: join([
-                q.reference.as_deref().map(mask),
-                kind_label(q.mode.as_deref()),
-            ])
-            .into(),
-            status: "queued".into(),
-            tone: DIM,
-        }
+    rows.extend(snap.queue.iter().map(|q| TaskItem {
+        badge: if q.reference.is_some() { "GH" } else { "CLI" }.into(),
+        title: mask(&q.title),
+        meta: join([
+            q.reference.as_deref().map(mask),
+            kind_label(q.mode.as_deref()),
+        ]),
+        status: "queued".into(),
+        tone: DIM,
+        link: q.url.clone().filter(|u| is_github(u)),
     }));
     if rows.is_empty() {
         return (rows, "Nothing running and nothing queued".into());
     }
-    let extra = rows.len().saturating_sub(TASK_ROWS);
-    rows.truncate(TASK_ROWS);
+    let extra = rows.len().saturating_sub(max);
+    rows.truncate(max);
     (rows, hint_more(extra))
 }
 
-/// "Needs you" rows; returns (rows, hint).
-pub fn need_items(snap: &Snapshot, now: i64) -> (Vec<NeedItem>, String) {
+/// "Needs you" rows, at most `max`; returns (rows, hint).
+pub fn need_items(snap: &Snapshot, now: i64, max: usize) -> (Vec<NeedItem>, String) {
     let rows: Vec<NeedItem> = snap
         .needs
         .iter()
-        .take(NEED_ROWS)
+        .take(max)
         .map(|n| {
             let t = &n.task;
             let r = t.reference.as_deref().map(mask);
@@ -219,10 +373,11 @@ pub fn need_items(snap: &Snapshot, now: i64) -> (Vec<NeedItem>, String) {
             };
             NeedItem {
                 label: label.into(),
-                title: mask(&t.title).into(),
-                detail: detail.into(),
-                age: age.into(),
+                title: mask(&t.title),
+                detail,
+                age,
                 tone,
+                link: github_link(t),
             }
         })
         .collect();
@@ -283,10 +438,11 @@ pub fn done_items(snap: &Snapshot, now: i64, max_rows: usize) -> (Vec<DoneItem>,
             };
             DoneItem {
                 badge: badge(&t.source).into(),
-                title: title.into(),
-                outcome: outcome.into(),
-                age: ago(now - t.finished_at.unwrap_or(now)).into(),
+                title,
+                outcome,
+                age: ago(now - t.finished_at.unwrap_or(now)),
                 tone,
+                link: github_link(t),
             }
         })
         .collect();
@@ -317,47 +473,49 @@ pub fn metric_items(m: &Metrics, gpu_shown: bool, loadavg: Option<String>) -> Ve
         MetricItem {
             label: "CPU".into(),
             value: s.cpu.unwrap_or(0.0),
-            text: pct(s.cpu).into(),
-            detail: loadavg
-                .map(|l| format!("load {l}"))
-                .unwrap_or_default()
-                .into(),
-            spark: m.cpu.sparkline_path().into(),
+            text: pct(s.cpu),
+            detail: loadavg.map(|l| format!("load {l}")).unwrap_or_default(),
+            spark: m.cpu.sparkline_path(),
             shown: true,
         },
         MetricItem {
             label: "RAM".into(),
             value: s.mem.map(|x| x.used_fraction()).unwrap_or(0.0),
-            text: pct(s.mem.map(|x| x.used_fraction())).into(),
+            text: pct(s.mem.map(|x| x.used_fraction())),
             detail: s
                 .mem
                 .map(|x| format!("{} / {} GB", gb(x.used_kb()), gb(x.total_kb)))
-                .unwrap_or_default()
-                .into(),
-            spark: m.mem.sparkline_path().into(),
+                .unwrap_or_default(),
+            spark: m.mem.sparkline_path(),
             shown: true,
         },
         MetricItem {
             label: "DISK".into(),
             value: s.disk.map(|d| d.busy).unwrap_or(0.0),
-            text: pct(s.disk.map(|d| d.busy)).into(),
+            text: pct(s.disk.map(|d| d.busy)),
             detail: s
                 .disk
                 .map(|d| format!("R {}  W {} MB/s", mbs(d.read_bps), mbs(d.write_bps)))
-                .unwrap_or_default()
-                .into(),
-            spark: m.disk.sparkline_path().into(),
+                .unwrap_or_default(),
+            spark: m.disk.sparkline_path(),
             shown: true,
         },
         MetricItem {
             label: "GPU".into(),
             value: s.gpu.unwrap_or(0.0),
-            text: pct(s.gpu).into(),
-            detail: SharedString::new(),
-            spark: m.gpu.sparkline_path().into(),
+            text: pct(s.gpu),
+            detail: String::new(),
+            spark: m.gpu.sparkline_path(),
             shown: gpu_shown,
         },
     ]
+}
+
+/// This machine's name, for the header.
+pub fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_else(|_| "hermes".into())
 }
 
 /// First three fields of /proc/loadavg.
@@ -390,14 +548,14 @@ pub fn mood(health: &Health, snap: &Snapshot) -> Mood {
 
 pub fn mascot_art(a: Animal, m: Mood) -> &'static str {
     match (a, m) {
-        (Animal::Beaver, Mood::Working) => include_str!("../../ui/art/beaver/working.txt"),
-        (Animal::Beaver, Mood::Idle) => include_str!("../../ui/art/beaver/idle.txt"),
-        (Animal::Beaver, Mood::NeedsYou) => include_str!("../../ui/art/beaver/needs.txt"),
-        (Animal::Beaver, Mood::Broken) => include_str!("../../ui/art/beaver/broken.txt"),
-        (Animal::Squirrel, Mood::Working) => include_str!("../../ui/art/squirrel/working.txt"),
-        (Animal::Squirrel, Mood::Idle) => include_str!("../../ui/art/squirrel/idle.txt"),
-        (Animal::Squirrel, Mood::NeedsYou) => include_str!("../../ui/art/squirrel/needs.txt"),
-        (Animal::Squirrel, Mood::Broken) => include_str!("../../ui/art/squirrel/broken.txt"),
+        (Animal::Beaver, Mood::Working) => include_str!("../ui/art/beaver/working.txt"),
+        (Animal::Beaver, Mood::Idle) => include_str!("../ui/art/beaver/idle.txt"),
+        (Animal::Beaver, Mood::NeedsYou) => include_str!("../ui/art/beaver/needs.txt"),
+        (Animal::Beaver, Mood::Broken) => include_str!("../ui/art/beaver/broken.txt"),
+        (Animal::Squirrel, Mood::Working) => include_str!("../ui/art/squirrel/working.txt"),
+        (Animal::Squirrel, Mood::Idle) => include_str!("../ui/art/squirrel/idle.txt"),
+        (Animal::Squirrel, Mood::NeedsYou) => include_str!("../ui/art/squirrel/needs.txt"),
+        (Animal::Squirrel, Mood::Broken) => include_str!("../ui/art/squirrel/broken.txt"),
     }
     .trim_end_matches('\n')
 }
@@ -411,8 +569,8 @@ pub fn mascot_font_px(a: Animal) -> f32 {
     }
 }
 
-/// The animal panel's title: `animal_name` if set, else the animal's own name.
-pub fn mascot_title(ui: &UiConfig) -> String {
+/// The animal's name: `animal_name` if set, else the animal's own name.
+pub fn animal_name(ui: &UiConfig) -> String {
     let default = match ui.animal {
         Animal::Beaver => "Beaver",
         Animal::Squirrel => "Squirrel",
@@ -422,7 +580,21 @@ pub fn mascot_title(ui: &UiConfig) -> String {
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .unwrap_or(default)
-        .to_uppercase()
+        .to_owned()
+}
+
+/// The animal panel's title: its name in capitals.
+pub fn mascot_title(ui: &UiConfig) -> String {
+    animal_name(ui).to_uppercase()
+}
+
+/// How many things need the owner. PRs waiting for review don't count: there are
+/// usually some, and the sign would never come down.
+pub fn needs_you(snap: &Snapshot) -> usize {
+    snap.needs
+        .iter()
+        .filter(|n| n.kind != NeedKind::Review)
+        .count()
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
@@ -438,11 +610,7 @@ pub fn mascot_caption(m: Mood, snap: &Snapshot) -> (String, i32) {
     match m {
         Mood::Broken => ("Something's broken: see the banner".into(), DANGER),
         Mood::NeedsYou => {
-            let n = snap
-                .needs
-                .iter()
-                .filter(|n| n.kind != NeedKind::Review)
-                .count();
+            let n = needs_you(snap);
             (
                 format!(
                     "{} need{} you",
@@ -527,7 +695,7 @@ mod tests {
             running: vec![working, waiting, stale],
             ..Default::default()
         };
-        let (rows, hint) = task_items(&snap, 3600, 1800);
+        let (rows, hint) = task_items(&snap, 3600, 1800, TASK_ROWS);
         assert_eq!(hint, "");
         assert_eq!(rows[0].status, "working · 1h 0m");
         assert_eq!(rows[0].tone, WORKING);
@@ -540,7 +708,7 @@ mod tests {
 
     #[test]
     fn tasks_overflow_and_empty() {
-        let (rows, hint) = task_items(&Snapshot::default(), 0, 1800);
+        let (rows, hint) = task_items(&Snapshot::default(), 0, 1800, TASK_ROWS);
         assert!(rows.is_empty());
         assert_eq!(hint, "Nothing running and nothing queued");
 
@@ -551,13 +719,17 @@ mod tests {
                     reference: Some(format!("o/r#{i}")),
                     mode: Some("new".into()),
                     title: format!("q{i}"),
+                    url: None,
                 })
                 .collect(),
             ..Default::default()
         };
-        let (rows, hint) = task_items(&snap, 0, 1800);
+        let (rows, hint) = task_items(&snap, 0, 1800, TASK_ROWS);
         assert_eq!(rows.len(), TASK_ROWS);
         assert_eq!(hint, "+2 more");
+        let (all, hint) = task_items(&snap, 0, 1800, usize::MAX);
+        assert_eq!(all.len(), 7);
+        assert_eq!(hint, "");
         assert_eq!(rows[3].status, "queued");
         assert_eq!(rows[3].meta, "o/r#0  ·  new PR");
     }
@@ -595,13 +767,20 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (rows, hint) = need_items(&snap, 7200);
+        let (rows, hint) = need_items(&snap, 7200, NEED_ROWS);
         assert_eq!(rows.len(), NEED_ROWS);
         assert_eq!(rows[0].label, "WAITING");
         assert!(rows[0].detail.contains("token=••••"), "{}", rows[0].detail);
         assert_eq!(rows[1].detail, "o/r#2  ·  PR #41 ready for review");
         assert_eq!(hint, "+2 more PRs to review");
-        let (_, empty) = need_items(&Snapshot::default(), 0);
+        let (all, hint) = need_items(&snap, 7200, usize::MAX);
+        assert_eq!(all.len(), 5);
+        assert_eq!(hint, "");
+        assert_eq!(
+            all[1].link.as_deref(),
+            Some("https://github.com/o/r/pull/41")
+        );
+        let (_, empty) = need_items(&Snapshot::default(), 0, NEED_ROWS);
         assert_eq!(empty, "Nothing needs you right now");
     }
 
@@ -689,6 +868,67 @@ mod tests {
                 moods.iter().map(|m| mascot_art(a, *m)).collect();
             assert_eq!(distinct.len(), moods.len(), "{a:?}");
         }
+    }
+
+    #[test]
+    fn links_go_to_github_only() {
+        let mut t = task(1, "github", "working");
+        assert_eq!(github_link(&t), None);
+        t.url = Some("https://github.com/o/r/issues/3".into());
+        assert_eq!(
+            github_link(&t).as_deref(),
+            Some("https://github.com/o/r/issues/3")
+        );
+        t.pr_url = Some("https://github.com/o/r/pull/4".into());
+        assert_eq!(
+            github_link(&t).as_deref(),
+            Some("https://github.com/o/r/pull/4"),
+            "the PR beats the issue"
+        );
+        for bad in [
+            "javascript:alert(1)",
+            "http://github.com/o/r",
+            "https://github.com.evil.com/o/r",
+            "https://github.com/",
+            "https://github.com/o/r\"><script>",
+            "https://evil.com/?https://github.com/",
+        ] {
+            t.url = Some(bad.into());
+            t.pr_url = None;
+            assert_eq!(github_link(&t), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_web_view_gets_every_row() {
+        let snap = Snapshot {
+            running: (0..9).map(|i| task(i, "github", "working")).collect(),
+            needs: (0..6)
+                .map(|i| NeedRow {
+                    kind: NeedKind::Failed,
+                    task: task(100 + i, "github", "failed"),
+                })
+                .collect(),
+            finished: (0..20).map(|i| task(200 + i, "github", "done")).collect(),
+            ..Default::default()
+        };
+        let state = State {
+            snapshot: snap,
+            ..Default::default()
+        };
+        let config = Config::default();
+        let screen = dashboard(&state, &config, 0, Fit::Screen, None);
+        assert_eq!(screen.tasks.len(), TASK_ROWS);
+        assert_eq!(screen.tasks_hint, "+4 more");
+        assert_eq!(screen.needs.len(), NEED_ROWS);
+        assert_eq!(screen.done.len(), 2, "what fits under three needs");
+        let all = dashboard(&state, &config, 0, Fit::All, None);
+        assert_eq!(all.tasks.len(), 9);
+        assert_eq!(all.tasks_hint, "");
+        assert_eq!(all.needs.len(), 6);
+        assert_eq!(all.done.len(), config.tasks.finished_rows);
+        assert_eq!(all.needs_you, 6);
+        assert_eq!(all.mascot_caption, "6 things need you");
     }
 
     #[test]

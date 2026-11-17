@@ -2,7 +2,7 @@
 //!
 //! Writers: `hermes-beaver mcp` (long-lived child of Hermes), `hermes-beaver call`
 //! (short-lived, from scripts) and the GUI's reconciliation. WAL mode plus a busy
-//! timeout lets them coexist. Migrations are additive only: an older binary may
+//! timeout lets them coexist. The web view only reads ([`Store::open_read_only`]). Migrations are additive only: an older binary may
 //! still be running against a newer schema.
 
 pub mod views;
@@ -10,7 +10,7 @@ pub mod views;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::display;
 
@@ -92,6 +92,19 @@ impl Store {
         }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         Self::init(conn)
+    }
+
+    /// Opens an existing store without ever writing to it: no migrations, no
+    /// `go_live_at`, and SQLite refuses writes. Fails while the store doesn't exist.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening {} read-only", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.execute_batch("PRAGMA query_only = ON;")?;
+        Ok(Self { conn })
     }
 
     #[cfg(test)]
@@ -265,6 +278,27 @@ mod tests {
         assert_eq!(again.go_live_at().unwrap(), 123);
         assert!(go_live > 0);
         drop(again);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn read_only_store_reads_and_never_writes() {
+        let dir = std::env::temp_dir().join(format!("hb-ro-{}", std::process::id()));
+        let path = dir.join("events.db");
+        assert!(Store::open_read_only(&path).is_err(), "no store yet");
+        assert!(!path.exists());
+        let mut w = Store::open(&path).unwrap();
+        crate::tools::call(
+            &mut w,
+            &Default::default(),
+            "task_start",
+            serde_json::json!({"source": "direct", "title": "x"}),
+        )
+        .unwrap();
+        let r = Store::open_read_only(&path).unwrap();
+        assert_eq!(r.snapshot(8).unwrap().running.len(), 1);
+        assert!(r.conn.execute("DELETE FROM tasks", []).is_err());
+        drop((r, w));
         std::fs::remove_dir_all(dir).ok();
     }
 

@@ -1,0 +1,17 @@
+[Unit]
+Description=hermes-beaver web view: the dashboard as a read-only page for other computers
+Documentation=https://github.com/ideaconnect/hermes-beaver
+# Independent of the kiosk: lingering starts the user manager at boot, and this runs
+# without sway. It listens on [web] listen in ~/.config/hermes-beaver/config.toml.
+
+[Service]
+ExecStart=%h/.local/bin/hermes-beaver web
+# Also covers a LAN address that isn't up yet at boot: the bind fails and is retried.
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=15
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

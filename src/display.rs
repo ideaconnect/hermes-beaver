@@ -169,18 +169,41 @@ pub fn describe(reply: &Value, now: DateTime<Local>) -> String {
         .as_str()
         .and_then(|u| DateTime::parse_from_rfc3339(u).ok())
         .map(|t| t.with_timezone(&Local));
-    let Some(t) = until else {
-        return format!("Screen {state}.");
+    match until {
+        Some(t) => format!("Screen {state} until {}.", when(t, now)),
+        None => format!("Screen {state}."),
+    }
+}
+
+/// The monitor's state for the web view, e.g. "Screen in standby until 09:00". It's
+/// what was asked for and scheduled: a key press on the dashboard machine can light
+/// the screen for a while without changing it.
+pub fn status_line(req: &Request, schedule: &Schedule, now: i64) -> String {
+    if req.mode == Mode::Vacation {
+        return "Screen off: vacation".into();
+    }
+    let state = if wants_off(req, schedule, now) {
+        "Screen in standby"
+    } else {
+        "Screen on"
     };
+    let local = |t: i64| Local.timestamp_opt(t, 0).single();
+    match (next_change(req, schedule, now).and_then(local), local(now)) {
+        (Some(t), Some(now)) => format!("{state} until {}", when(t, now)),
+        _ => state.into(),
+    }
+}
+
+/// "09:00" today, "tomorrow 09:00", else "Mon 14 Jan 09:00".
+fn when(t: DateTime<Local>, now: DateTime<Local>) -> String {
     let today = now.date_naive();
-    let when = if t.date_naive() == today {
+    if t.date_naive() == today {
         t.format("%H:%M").to_string()
     } else if today.succ_opt() == Some(t.date_naive()) {
         t.format("tomorrow %H:%M").to_string()
     } else {
         t.format("%a %-d %b %H:%M").to_string()
-    };
-    format!("Screen {state} until {when}.")
+    }
 }
 
 pub trait Power {
@@ -555,6 +578,34 @@ mod tests {
         );
         assert_eq!(describe(&reply("on", None, false), now), "Screen on.");
         assert!(describe(&reply("off", None, true), now).starts_with("Vacation mode"));
+    }
+
+    #[test]
+    fn status_lines_for_the_web_view() {
+        let s = nightly();
+        let never = Request::default();
+        assert_eq!(
+            status_line(&never, &s, at(10, 12, 0)),
+            "Screen on until 23:00"
+        );
+        assert_eq!(
+            status_line(&never, &s, at(10, 23, 30)),
+            "Screen in standby until tomorrow 09:00"
+        );
+        let out = req(Mode::Off, at(10, 12, 0), Some(at(10, 15, 30)));
+        assert_eq!(
+            status_line(&out, &s, at(10, 12, 5)),
+            "Screen in standby until 15:30"
+        );
+        let vacation = req(Mode::Vacation, at(10, 12, 0), None);
+        assert_eq!(
+            status_line(&vacation, &s, at(10, 12, 5)),
+            "Screen off: vacation"
+        );
+        assert_eq!(
+            status_line(&never, &Schedule::default(), at(10, 12, 0)),
+            "Screen on"
+        );
     }
 
     #[test]

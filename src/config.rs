@@ -3,6 +3,7 @@
 //! Every key is optional. A missing file means all defaults. Unknown keys are
 //! rejected so that typos don't silently fall back to defaults.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -23,6 +24,24 @@ pub struct Config {
     pub metrics: MetricsConfig,
     pub display: DisplayConfig,
     pub ui: UiConfig,
+    pub web: WebConfig,
+}
+
+/// `hermes-beaver web`, the read-only page for other computers.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebConfig {
+    /// Address and port to listen on. The default is reachable from this machine
+    /// only; set the LAN address to open it from others.
+    pub listen: String,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            listen: "127.0.0.1:8788".into(),
+        }
+    }
 }
 
 /// Daily monitor standby. Times are "HH:MM"; either may be left out.
@@ -206,6 +225,7 @@ impl Config {
             schedule.off_at.is_none() || schedule.off_at != schedule.on_at,
             "display.off_at and display.on_at must differ"
         );
+        self.web_listen()?;
         if let Some(tz) = &self.timezone {
             ensure!(
                 !tz.is_empty() && !tz.starts_with('/') && !tz.contains(".."),
@@ -217,6 +237,16 @@ impl Config {
             );
         }
         Ok(())
+    }
+
+    /// `[web] listen` as an address.
+    pub fn web_listen(&self) -> Result<SocketAddr> {
+        let l = self.web.listen.trim();
+        l.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "web.listen must be an IP address and port like \"192.168.1.10:8788\", got {l:?}"
+            )
+        })
     }
 
     /// The monitor's daily schedule (validated at load).
@@ -365,6 +395,17 @@ mod tests {
         let err = |text: &str| format!("{:#}", Config::parse(text).unwrap_err());
         assert!(err("[display]\noff_at = \"11pm\"").contains("like \"23:00\""));
         assert!(err("[display]\noff_at = \"09:00\"\non_at = \"09:00\"").contains("must differ"));
+    }
+
+    #[test]
+    fn web_listen_defaults_to_this_machine_only() {
+        let c = Config::default();
+        assert_eq!(c.web_listen().unwrap(), "127.0.0.1:8788".parse().unwrap());
+        let c = Config::parse("[web]\nlisten = \"192.168.87.75:8788\"").unwrap();
+        assert_eq!(c.web_listen().unwrap().port(), 8788);
+        let err = |text: &str| format!("{:#}", Config::parse(text).unwrap_err());
+        assert!(err("[web]\nlisten = \"susel:8788\"").contains("IP address and port"));
+        assert!(err("[web]\nlisten = \"192.168.87.75\"").contains("IP address and port"));
     }
 
     #[test]

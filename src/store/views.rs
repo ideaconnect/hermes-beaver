@@ -29,6 +29,7 @@ pub struct QueueRow {
     pub reference: Option<String>,
     pub mode: Option<String>,
     pub title: String,
+    pub url: Option<String>,
 }
 
 /// Why a task is in the "Needs you" list. Order = display priority.
@@ -102,12 +103,13 @@ impl Store {
     pub fn queue(&self) -> Result<Vec<QueueRow>> {
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT ref, mode, title FROM queue_items ORDER BY position")?;
+            .prepare_cached("SELECT ref, mode, title, url FROM queue_items ORDER BY position")?;
         let rows = stmt.query_map([], |r| {
             Ok(QueueRow {
                 reference: r.get(0)?,
                 mode: r.get(1)?,
                 title: r.get(2)?,
+                url: r.get(3)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)

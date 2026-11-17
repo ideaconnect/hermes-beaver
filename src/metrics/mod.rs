@@ -26,7 +26,7 @@ pub struct Sample {
 }
 
 /// Something that produces samples: the real system or the demo generator.
-pub trait Source {
+pub trait Source: Send {
     fn sample(&mut self) -> Sample;
 }
 
@@ -143,6 +143,7 @@ impl Source for SystemSource {
 }
 
 /// Histories for every gauge, fed by a [`Source`].
+#[derive(Clone)]
 pub struct Metrics {
     pub cpu: History,
     pub mem: History,
