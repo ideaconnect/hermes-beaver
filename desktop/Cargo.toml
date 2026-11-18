@@ -1,0 +1,28 @@
+[package]
+name = "hermes-beaver-desktop"
+version = "0.1.0"
+edition = "2024"
+description = "Desktop window for the hermes-beaver web view"
+repository = "https://github.com/ideaconnect/hermes-beaver"
+license = "MIT"
+
+# A workspace of its own: the dashboard's build and CI never pull in Tauri.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2.7.6", features = [] }
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+# The system's web view (WebKitGTK, WebView2, WKWebView): no bundled browser.
+tauri = { version = "2.12.7", features = [] }
+# Requests to the dashboard, with the token. Plain HTTP on the LAN, HTTPS behind a proxy.
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
+# GitHub links open in the system's browser.
+open = "5.4.5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

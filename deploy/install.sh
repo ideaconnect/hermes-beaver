@@ -89,6 +89,30 @@ as_user systemctl --user unset-environment DISPLAY XAUTHORITY XAUTHLOCALHOSTNAME
 as_user systemctl --user daemon-reload
 
 step "Web view: starts with the user manager (lingering: at boot), independent of sway"
+# [web] token_file: generated once when missing, readable by the user (the web view
+# runs as them) and root only. An existing file or directory is left as it is.
+TOKEN_FILE=$(sed -n 's/^token_file *= *"\([^"]*\)".*/\1/p' "$CONFIG" | tail -1)
+case $TOKEN_FILE in "~/"*) TOKEN_FILE=$USER_HOME/${TOKEN_FILE#"~/"} ;; esac
+if [ -n "$TOKEN_FILE" ]; then
+    if [ ! -e "$TOKEN_FILE" ]; then
+        TOKEN_DIR=$(dirname "$TOKEN_FILE")
+        if [ ! -d "$TOKEN_DIR" ]; then
+            case $TOKEN_DIR in
+                "$USER_HOME"/*) as_user mkdir -p "$TOKEN_DIR" ;;
+                *) install -d -m 755 "$TOKEN_DIR" ;;
+            esac
+        fi
+        (umask 077 && od -An -vtx1 -N32 /dev/urandom | tr -d ' \n' > "$STAGE/web.token" && echo >> "$STAGE/web.token")
+        install -m 640 -o root -g "$USER_NAME" "$STAGE/web.token" "$TOKEN_FILE"
+        rm -f "$STAGE/web.token"
+        echo "generated a token in $TOKEN_FILE; the desktop app asks for it once (sudo cat $TOKEN_FILE)"
+    else
+        echo "token in $TOKEN_FILE"
+    fi
+    as_user test -r "$TOKEN_FILE" || echo "warning: $USER_NAME can't read $TOKEN_FILE, so the web view won't start" >&2
+else
+    echo "no [web] token_file: no token"
+fi
 loginctl enable-linger "$USER_NAME"
 as_user systemctl --user enable hermes-beaver-web.service
 as_user systemctl --user restart hermes-beaver-web.service
