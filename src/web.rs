@@ -8,7 +8,10 @@
 //!   `/favicon.svg`. `/state.json` is the page's own feed, polled every 5 s, and not
 //!   an API: its shape follows the page, and scripts use MCP or `call`. It carries
 //!   the build, and an open page reloads itself when that changes.
-//! - No login and no TLS: it listens where `[web] listen` says, on the LAN.
+//! - No TLS: it listens where `[web] listen` says, on the LAN. With `[web]
+//!   token_file` set, every request must carry that token: the desktop app
+//!   (`desktop/`) sends it as a bearer token, a browser as the password of the
+//!   sign-in prompt a 401 brings up. Without it, there's no login.
 
 use std::net::{IpAddr, Ipv6Addr};
 use std::path::Path;
@@ -40,11 +43,17 @@ const CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'un
 
 pub fn serve(config: &Config, mode: &Mode, store_path: &Path) -> Result<()> {
     let addr = config.web_listen()?;
+    let token = config.web_token()?;
     let server = tiny_http::Server::http(addr).map_err(|e| anyhow!("listening on {addr}: {e}"))?;
     let mut feed = Feed::new(config, mode, store_path, Access::ReadOnly)?;
     feed.refresh(store::now());
-    let site = Arc::new(Site::new(config, mode, build_id(), feed.state.clone()));
-    eprintln!("hermes-beaver: web view on http://{addr}/");
+    let login = if token.is_some() {
+        " (token required)"
+    } else {
+        ""
+    };
+    let site = Arc::new(Site::new(config, mode, build_id(), feed.state.clone()).with_token(token));
+    eprintln!("hermes-beaver: web view on http://{addr}/{login}");
 
     let server = Arc::new(server);
     let http = {
@@ -88,6 +97,8 @@ struct Site {
     hostname: String,
     name: String,
     mascot_title: String,
+    /// `[web] token_file`'s token, which every request must carry when set.
+    token: Option<String>,
     state: Mutex<Arc<State>>,
 }
 
@@ -158,8 +169,14 @@ impl Site {
             },
             name: view::animal_name(&config.ui),
             mascot_title: view::mascot_title(&config.ui),
+            token: None,
             state: Mutex::new(Arc::new(state)),
         }
+    }
+
+    fn with_token(mut self, token: Option<String>) -> Self {
+        self.token = token;
+        self
     }
 
     fn publish(&self, state: State) {
@@ -167,12 +184,20 @@ impl Site {
     }
 
     fn handle(&self, req: tiny_http::Request) {
-        let host = req
-            .headers()
-            .iter()
-            .find(|h| h.field.equiv("Host"))
-            .map(|h| h.value.as_str().to_owned());
-        let reply = self.reply(req.method(), req.url(), host.as_deref(), now_ms());
+        let header = |name: &'static str| {
+            req.headers()
+                .iter()
+                .find(|h| h.field.equiv(name))
+                .map(|h| h.value.as_str().to_owned())
+        };
+        let (host, auth) = (header("Host"), header("Authorization"));
+        let reply = self.reply(
+            req.method(),
+            req.url(),
+            host.as_deref(),
+            auth.as_deref(),
+            now_ms(),
+        );
         let mut resp = tiny_http::Response::from_data(reply.body).with_status_code(reply.status);
         for (name, value) in reply.headers {
             if let Ok(h) = tiny_http::Header::from_bytes(name, value) {
@@ -182,7 +207,14 @@ impl Site {
         let _ = req.respond(resp);
     }
 
-    fn reply(&self, method: &Method, url: &str, host: Option<&str>, now_ms: i64) -> Reply {
+    fn reply(
+        &self,
+        method: &Method,
+        url: &str,
+        host: Option<&str>,
+        auth: Option<&str>,
+        now_ms: i64,
+    ) -> Reply {
         if !matches!(method, Method::Get | Method::Head) {
             return Reply::text(405, "This page is read-only.\n").with("Allow", "GET, HEAD");
         }
@@ -191,6 +223,20 @@ impl Site {
                 403,
                 "This page answers to its IP address or LAN name only.\n",
             );
+        }
+        if let Some(token) = &self.token
+            && !carries_token(auth, token)
+        {
+            return Reply::text(
+                401,
+                "This dashboard needs its token. The desktop app asks for it; in a browser, \
+                 sign in with any user name and the token as the password.\n",
+            )
+            .with(
+                "WWW-Authenticate",
+                "Basic realm=\"hermes-beaver\", charset=\"UTF-8\"",
+            )
+            .with("Cache-Control", "no-store");
         }
         match url.split(['?', '#']).next().unwrap_or_default() {
             "/" | "/index.html" => Reply::new(
@@ -262,6 +308,36 @@ fn local_host(host: &str) -> bool {
         && (!name.contains('.') || LOCAL.iter().any(|s| name.ends_with(s)))
 }
 
+/// Whether an `Authorization` header carries `token`: as a bearer token (the
+/// desktop app) or as the password of HTTP Basic, under any user name (a browser's
+/// sign-in prompt).
+fn carries_token(auth: Option<&str>, token: &str) -> bool {
+    use base64::Engine;
+    let Some((scheme, value)) = auth.and_then(|a| a.trim().split_once(' ')) else {
+        return false;
+    };
+    let value = value.trim();
+    if scheme.eq_ignore_ascii_case("bearer") {
+        return same(value.as_bytes(), token.as_bytes());
+    }
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return false;
+    }
+    let Ok(pair) = base64::engine::general_purpose::STANDARD.decode(value) else {
+        return false;
+    };
+    match pair.iter().position(|&b| b == b':') {
+        Some(colon) => same(&pair[colon + 1..], token.as_bytes()),
+        None => false,
+    }
+}
+
+/// Equality in a time that depends on the lengths only, not on where the first
+/// difference is.
+fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -322,7 +398,7 @@ mod tests {
     }
 
     fn get(site: &Site, path: &str, host: Option<&str>) -> Reply {
-        site.reply(&Method::Get, path, host, 1_793_713_141_000)
+        site.reply(&Method::Get, path, host, None, 1_793_713_141_000)
     }
 
     fn header(r: &Reply, name: &str) -> Option<&'static str> {
@@ -393,11 +469,87 @@ mod tests {
         let fav = get(&site, "/favicon.svg", None);
         assert_eq!(fav.status, 200);
         assert_eq!(header(&fav, "Content-Type"), Some("image/svg+xml"));
-        let post = site.reply(&Method::Post, "/", None, 0);
+        let post = site.reply(&Method::Post, "/", None, None, 0);
         assert_eq!(post.status, 405);
         assert_eq!(header(&post, "Allow"), Some("GET, HEAD"));
         assert_eq!(get(&site, "/", Some("evil.example.com")).status, 403);
         assert_eq!(get(&site, "/state.json", Some("susel:8788")).status, 200);
+    }
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn a_token_guards_every_route() {
+        let site = site(State::default()).with_token(Some(TOKEN.into()));
+        let with = |path: &str, auth: Option<&str>| {
+            site.reply(&Method::Get, path, Some("susel:8788"), auth, 0)
+        };
+        for path in ["/", "/state.json", "/favicon.svg", "/nope"] {
+            let r = with(path, None);
+            assert_eq!(r.status, 401, "{path}");
+            assert_eq!(
+                header(&r, "WWW-Authenticate"),
+                Some("Basic realm=\"hermes-beaver\", charset=\"UTF-8\""),
+                "a browser shows its sign-in prompt"
+            );
+            assert_eq!(header(&r, "Cache-Control"), Some("no-store"));
+        }
+        let bearer = format!("Bearer {TOKEN}");
+        assert_eq!(with("/state.json", Some(&bearer)).status, 200);
+        assert_eq!(with("/", Some(&format!("bearer  {TOKEN} "))).status, 200);
+        assert_eq!(with("/nope", Some(&bearer)).status, 404);
+        // A browser: any user name, the token as the password.
+        let basic = |pair: &str| {
+            use base64::Engine;
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(pair)
+            )
+        };
+        assert_eq!(with("/", Some(&basic(&format!("me:{TOKEN}")))).status, 200);
+        assert_eq!(with("/", Some(&basic(&format!(":{TOKEN}")))).status, 200);
+        for bad in [
+            format!("Bearer {}", &TOKEN[1..]),
+            format!("Bearer {TOKEN}x"),
+            format!("Bearer {}", TOKEN.to_uppercase()),
+            format!("Token {TOKEN}"),
+            TOKEN.to_string(),
+            basic(TOKEN),
+            basic(&format!("{TOKEN}:me")),
+            "Basic !!!".into(),
+            "Bearer".into(),
+            String::new(),
+        ] {
+            assert_eq!(with("/state.json", Some(&bad)).status, 401, "{bad:?}");
+        }
+        // The other checks come first: no prompt for a rebinding page.
+        assert_eq!(
+            site.reply(&Method::Get, "/", Some("evil.com"), None, 0)
+                .status,
+            403
+        );
+        assert_eq!(site.reply(&Method::Post, "/", None, None, 0).status, 405);
+    }
+
+    #[test]
+    fn no_token_lets_everyone_in() {
+        let site = site(State::default());
+        let r = site.reply(
+            &Method::Get,
+            "/state.json",
+            None,
+            Some("Bearer whatever"),
+            0,
+        );
+        assert_eq!(r.status, 200);
+    }
+
+    #[test]
+    fn comparing_tokens() {
+        assert!(same(b"abc", b"abc"));
+        assert!(!same(b"abc", b"abd"));
+        assert!(!same(b"abc", b"abcd"));
+        assert!(same(b"", b""));
     }
 
     #[test]
@@ -430,12 +582,10 @@ mod tests {
         }
     }
 
-    /// The real server, end to end over TCP.
-    #[test]
-    fn serves_over_http() {
+    /// One request to the real server, end to end over TCP; the raw response.
+    fn over_tcp(site: Site, extra_headers: &str) -> String {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_ip().unwrap();
-        let site = site(State::default());
         let handler = std::thread::spawn(move || {
             let req = server.recv().unwrap();
             site.handle(req);
@@ -443,16 +593,32 @@ mod tests {
         let mut conn = std::net::TcpStream::connect(addr).unwrap();
         write!(
             conn,
-            "GET /state.json HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+            "GET /state.json HTTP/1.1\r\nHost: {addr}\r\n{extra_headers}Connection: close\r\n\r\n"
         )
         .unwrap();
         let mut out = String::new();
         conn.read_to_string(&mut out).unwrap();
         handler.join().unwrap();
+        out
+    }
+
+    #[test]
+    fn serves_over_http() {
+        let out = over_tcp(site(State::default()), "");
         assert!(out.starts_with("HTTP/1.1 200"), "{out}");
         assert!(out.contains("Referrer-Policy: no-referrer"), "{out}");
         let body = out.split("\r\n\r\n").nth(1).unwrap();
         let v: Value = serde_json::from_str(body).unwrap();
         assert_eq!(v["build"], "1.0-abc");
+    }
+
+    #[test]
+    fn reads_the_token_from_the_request_over_http() {
+        let guarded = || site(State::default()).with_token(Some(TOKEN.into()));
+        let out = over_tcp(guarded(), "");
+        assert!(out.starts_with("HTTP/1.1 401"), "{out}");
+        assert!(out.contains("WWW-Authenticate: Basic"), "{out}");
+        let out = over_tcp(guarded(), &format!("Authorization: Bearer {TOKEN}\r\n"));
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
     }
 }

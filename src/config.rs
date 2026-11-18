@@ -34,15 +34,23 @@ pub struct WebConfig {
     /// Address and port to listen on. The default is reachable from this machine
     /// only; set the LAN address to open it from others.
     pub listen: String,
+    /// A file holding the token every request must carry: the desktop app sends it
+    /// as a bearer token, a browser as the password of its sign-in prompt. Unset:
+    /// no token. Read when `web` starts; a leading `~/` is expanded.
+    pub token_file: Option<String>,
 }
 
 impl Default for WebConfig {
     fn default() -> Self {
         Self {
             listen: "127.0.0.1:8788".into(),
+            token_file: None,
         }
     }
 }
+
+/// Shorter tokens could be guessed: the web view doesn't limit attempts.
+pub const MIN_TOKEN_LEN: usize = 16;
 
 /// Daily monitor standby. Times are "HH:MM"; either may be left out.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -249,6 +257,30 @@ impl Config {
         })
     }
 
+    /// The token from `[web] token_file`, or `None` when that's unset. A file that
+    /// can't be read or holds no usable token is an error, so the page never opens
+    /// up because a file went missing.
+    pub fn web_token(&self) -> Result<Option<String>> {
+        let Some(file) = &self.web.token_file else {
+            return Ok(None);
+        };
+        let path = expand_tilde(file.trim(), dirs::home_dir());
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading web.token_file {}", path.display()))?;
+        let token = text.trim();
+        ensure!(
+            token.len() >= MIN_TOKEN_LEN,
+            "web.token_file {} must hold a token of at least {MIN_TOKEN_LEN} characters",
+            path.display()
+        );
+        ensure!(
+            token.bytes().all(|b| b.is_ascii_graphic()),
+            "web.token_file {}: the token must be printable ASCII, without spaces",
+            path.display()
+        );
+        Ok(Some(token.to_owned()))
+    }
+
     /// The monitor's daily schedule (validated at load).
     pub fn schedule(&self) -> Schedule {
         self.try_schedule().unwrap_or_default()
@@ -406,6 +438,35 @@ mod tests {
         let err = |text: &str| format!("{:#}", Config::parse(text).unwrap_err());
         assert!(err("[web]\nlisten = \"susel:8788\"").contains("IP address and port"));
         assert!(err("[web]\nlisten = \"192.168.87.75\"").contains("IP address and port"));
+    }
+
+    #[test]
+    fn web_token_comes_from_its_file() {
+        assert_eq!(Config::default().web_token().unwrap(), None);
+        let dir = std::env::temp_dir().join(format!("hb-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let with = |name: &str, text: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            let mut c = Config::default();
+            c.web.token_file = Some(path.display().to_string());
+            c.web_token()
+        };
+        assert_eq!(
+            with("ok", "  0123456789abcdef0123\n").unwrap().as_deref(),
+            Some("0123456789abcdef0123"),
+            "surrounding whitespace and the newline are not part of it"
+        );
+        let err = |r: Result<Option<String>>| format!("{:#}", r.unwrap_err());
+        assert!(err(with("short", "abc\n")).contains("at least 16"));
+        assert!(err(with("empty", "")).contains("at least 16"));
+        assert!(err(with("space", "0123456789 abcdef0123")).contains("without spaces"));
+        let mut missing = Config::default();
+        missing.web.token_file = Some(dir.join("missing").display().to_string());
+        assert!(err(missing.web_token()).contains("reading web.token_file"));
+        let parsed = Config::parse("[web]\ntoken_file = \"/etc/secrets/t\"").unwrap();
+        assert_eq!(parsed.web.token_file.as_deref(), Some("/etc/secrets/t"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

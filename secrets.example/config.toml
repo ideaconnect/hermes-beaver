@@ -17,3 +17,7 @@ animal_name = "Beaver"   # its panel's title (shown in capitals); default: the a
 
 [web]
 listen = "<LAN address>:8788"   # `hermes-beaver web`; default 127.0.0.1:8788 (this machine only)
+# Every request must carry this file's token: the desktop app asks for it once, a browser
+# shows a sign-in prompt (any user name, the token as password). `make deploy` generates
+# the file when it's missing. Leave it out for no token.
+token_file = "/etc/secrets/hermes-beaver-web.token"
