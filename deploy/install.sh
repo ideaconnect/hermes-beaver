@@ -21,11 +21,10 @@ kiosk_sum() { { cat /etc/systemd/system/$KIOSK /etc/pam.d/hermes-beaver-kiosk \
     "$USER_HOME/.config/hermes-beaver/sway.conf" "$USER_HOME"/.config/hermes-beaver/sway.d/*.conf \
     2>/dev/null || true; } | sha256sum; }
 
-step "System packages: ddcutil (brightness over DDC/CI), sway (Wayland compositor), wlopm (monitor standby), kbd (chvt)"
+step "System packages: ddcutil (brightness over DDC/CI), sway (Wayland compositor, also monitor standby), kbd (chvt)"
 PKGS=()
 command -v ddcutil >/dev/null || PKGS+=(ddcutil)
 command -v sway >/dev/null || PKGS+=(sway)
-command -v wlopm >/dev/null || PKGS+=(wlopm)
 command -v chvt >/dev/null || PKGS+=(kbd)
 # No recommends: they bring Xwayland, swaybg, swayidle, swaylock and a terminal.
 if [ ${#PKGS[@]} -eq 0 ]; then echo "already installed"
@@ -51,9 +50,10 @@ elif [ ! -f "$CONFIG" ]; then
     user_install -m 644 "$STAGE/default.toml" "$CONFIG"; echo "wrote an empty default"
 else echo "kept existing $CONFIG"; fi
 
-step "systemd user unit and sway config"
+step "systemd user units (dashboard, web view) and sway config"
 BEFORE=$(kiosk_sum)
 user_install -m 644 "$STAGE/hermes-beaver.service" "$USER_HOME/.config/systemd/user/hermes-beaver.service"
+user_install -m 644 "$STAGE/hermes-beaver-web.service" "$USER_HOME/.config/systemd/user/hermes-beaver-web.service"
 user_install -m 644 "$STAGE/sway.conf" "$USER_HOME/.config/hermes-beaver/sway.conf"
 if [ -f "$STAGE/sway-host.conf" ]; then
     user_install -m 644 "$STAGE/sway-host.conf" "$USER_HOME/.config/hermes-beaver/sway.d/host.conf"
@@ -88,6 +88,13 @@ as_user systemctl --user unset-environment DISPLAY XAUTHORITY XAUTHLOCALHOSTNAME
     XDG_DATA_DIRS QT_ACCESSIBILITY 2>/dev/null || true
 as_user systemctl --user daemon-reload
 
+step "Web view: starts with the user manager (lingering: at boot), independent of sway"
+loginctl enable-linger "$USER_NAME"
+as_user systemctl --user enable hermes-beaver-web.service
+as_user systemctl --user restart hermes-beaver-web.service
+LISTEN=$(sed -n 's/^listen *= *"\([^"]*\)".*/\1/p' "$CONFIG" | tail -1)
+echo "listening on http://${LISTEN:-127.0.0.1:8788 (the default: this machine only; set [web] listen)}/"
+
 step "(Re)start the kiosk and the dashboard"
 if ! systemctl is-active -q $KIOSK; then
     systemctl start $KIOSK; echo "started sway (it starts the dashboard)"
@@ -99,6 +106,7 @@ fi
 sleep 3
 systemctl --no-pager --lines=0 status $KIOSK || true
 as_user systemctl --user --no-pager --lines=5 status hermes-beaver.service || true
+as_user systemctl --user --no-pager --lines=3 status hermes-beaver-web.service || true
 
 step "Restart a running MCP server so Hermes respawns it on the new binary"
 if pkill -u "$USER_NAME" -f 'hermes-beaver mcp'; then echo "stopped the old MCP server"; else echo "none running"; fi

@@ -1,15 +1,21 @@
 mod brightness;
 mod config;
+mod demo;
 mod display;
+mod feed;
 mod health;
 mod hermes;
+mod idle;
 mod mask;
 mod mcp;
 mod metrics;
 mod reconcile;
 mod store;
+mod sway;
 mod tools;
 mod ui;
+mod view;
+mod web;
 
 use std::path::PathBuf;
 
@@ -67,6 +73,16 @@ enum Command {
         #[arg(value_enum)]
         action: DisplayAction,
     },
+    /// Serve the dashboard as a read-only web page for other computers, on the
+    /// address in `[web] listen` (default 127.0.0.1:8788, this machine only).
+    Web {
+        /// Made-up data instead of the live dashboard, as in `demo`.
+        #[arg(long)]
+        demo: bool,
+        /// With --demo, one scenario instead of cycling: busy, idle, overflow, broken, empty
+        #[arg(long, requires = "demo")]
+        scenario: Option<String>,
+    },
     /// Run the GUI against synthetic data, without touching Hermes.
     Demo {
         /// Show one scenario instead of cycling: busy, idle, overflow, broken, empty
@@ -92,18 +108,26 @@ fn main() -> Result<()> {
     match cli.command {
         None => ui::run(
             &config,
-            ui::Mode::Live,
+            feed::Mode::Live,
             &store_path,
             cli.screenshot.as_deref(),
             cli.windowed,
         ),
         Some(Command::Demo { scenario }) => ui::run(
             &config,
-            ui::Mode::Demo(scenario),
+            feed::Mode::Demo(scenario),
             &store_path,
             cli.screenshot.as_deref(),
             cli.windowed,
         ),
+        Some(Command::Web { demo, scenario }) => {
+            let mode = if demo {
+                feed::Mode::Demo(scenario)
+            } else {
+                feed::Mode::Live
+            };
+            web::serve(&config, &mode, &store_path)
+        }
         Some(Command::Mcp) => {
             let mut store = Store::open(&store_path)?;
             mcp::serve(&mut store, &config.schedule())

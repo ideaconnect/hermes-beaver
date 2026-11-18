@@ -5,7 +5,7 @@ BIN   := target/release/hermes-beaver
 STAGE := /tmp/hermes-beaver-deploy
 SSH   := ssh -o BatchMode=yes
 
-.PHONY: build test lint demo deploy check-env
+.PHONY: build test lint demo demo-web deploy check-env
 
 build:
 	cargo build --release
@@ -19,6 +19,10 @@ lint:
 
 demo:
 	cargo run --release -- demo
+
+# The web view on made-up data: open http://127.0.0.1:8788/
+demo-web:
+	cargo run --release -- web --demo
 
 check-env:
 	@test -n "$(DEPLOY_HOST)" -a -n "$(DEPLOY_USER)" || { echo "Missing secrets/deploy.env: cp -r secrets.example secrets"; exit 1; }

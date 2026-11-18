@@ -233,13 +233,13 @@ fn seed(store: &mut Store, scenario: Scenario) -> Result<()> {
             store,
             t - 12 * min,
             "task_start",
-            json!({"source": "github", "kind": "new", "title": "Fix the flaky checkout test on CI", "ref": "acme/api#139", "cron_job_id": "slot-1"}),
+            json!({"source": "github", "kind": "new", "title": "Fix the flaky checkout test on CI", "ref": "acme/api#139", "url": "https://github.com/acme/api/issues/139", "cron_job_id": "slot-1"}),
         )?;
         c(
             store,
             t - 41 * min,
             "task_start",
-            json!({"source": "github", "kind": "update", "title": "Address review: onboarding flow copy", "ref": "acme/web#77", "cron_job_id": "slot-2"}),
+            json!({"source": "github", "kind": "update", "title": "Address review: onboarding flow copy", "ref": "acme/web#77", "url": "https://github.com/acme/web/issues/77", "cron_job_id": "slot-2"}),
         )?;
         c(
             store,
@@ -264,9 +264,9 @@ fn seed(store: &mut Store, scenario: Scenario) -> Result<()> {
             t - 2 * min,
             "queue_set",
             json!({"items": [
-                {"ref": "acme/api#142", "mode": "new", "title": "Rate-limit the public search endpoint"},
-                {"ref": "acme/web#88", "mode": "update", "title": "Dark mode toggle: review comments"},
-                {"ref": "acme/cli#19", "mode": "new", "title": "Add --json output to the status command"}
+                {"ref": "acme/api#142", "mode": "new", "title": "Rate-limit the public search endpoint", "url": "https://github.com/acme/api/issues/142"},
+                {"ref": "acme/web#88", "mode": "update", "title": "Dark mode toggle: review comments", "url": "https://github.com/acme/web/issues/88"},
+                {"ref": "acme/cli#19", "mode": "new", "title": "Add --json output to the status command", "url": "https://github.com/acme/cli/issues/19"}
             ]}),
         )?;
     }

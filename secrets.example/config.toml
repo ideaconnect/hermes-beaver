@@ -14,3 +14,6 @@ on_at = "09:00"
 [ui]
 animal = "beaver"        # the ASCII animal: beaver | squirrel
 animal_name = "Beaver"   # its panel's title (shown in capitals); default: the animal's name
+
+[web]
+listen = "<LAN address>:8788"   # `hermes-beaver web`; default 127.0.0.1:8788 (this machine only)

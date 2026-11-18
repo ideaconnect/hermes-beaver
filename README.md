@@ -7,9 +7,10 @@ A lightweight, full-screen dashboard that runs next to [Hermes Agent](https://gi
 - CPU, memory, disk and GPU load, with 30-minute sparklines;
 - an ASCII animal, a beaver or a ground squirrel, whose mood follows the agent (working, napping, needs you, broken);
 - a red banner when Hermes itself is unhealthy;
-- a clock with ticking seconds, so you can tell at a glance that the screen isn't frozen.
+- a clock with ticking seconds, so you can tell at a glance that the screen isn't frozen;
+- a read-only web page with the same dashboard, for the other computers and phones on your LAN.
 
-It dims the monitor backlight over DDC/CI (`ddcutil`, which talks to the monitor over the cable, whatever the display server) when nothing is happening, and brightens it for a minute when something changes. The monitor goes into standby on a daily schedule (e.g. 23:00 to 09:00) and whenever you tell Hermes you're going to sleep or out (`/sleep`, `/awake`). Vacation mode (`/vacation`) keeps it off until you turn it back on. A key press or mouse move on the dashboard machine also wakes it, until ten minutes pass without input. The dashboard checks that the monitor follows: after each switch, and then once a minute, it reads the outputs' power mode (`wlopm -j`) and switches any output in the wrong mode, trying again every 10 seconds until they all follow. The exit code of a switch isn't enough: `wlopm --on '*'` succeeds when the monitor is briefly off the cable and there is no output to switch, and after `wlopm --off` sway keeps an output that reconnects under the same name in standby. Asking again (`/awake` while the screen should already be on) applies the state again too.
+It dims the monitor backlight over DDC/CI (`ddcutil`, which talks to the monitor over the cable, whatever the display server) when nothing is happening, and brightens it for a minute when something changes. The monitor goes into standby on a daily schedule (e.g. 23:00 to 09:00) and whenever you tell Hermes you're going to sleep or out (`/sleep`, `/awake`). Vacation mode (`/vacation`) keeps it off until you turn it back on. A key press or mouse move on the dashboard machine also wakes it, until ten minutes pass without input. The dashboard checks that the monitor follows: once a minute it reads the outputs' power back from sway and switches again if it doesn't match, so a switch that didn't take hold is caught within a minute. Asking again (`/awake` while the screen should already be on) applies the state again at once.
 
 Written in Rust with [Slint](https://slint.dev): one binary of about 17 MB that idles at about 0% CPU and about 40 MB RSS (16 MB of it are the two frame buffers it shares with the compositor). It's a Wayland client. On the host it runs in a kiosk session: [sway](https://swaywm.org) with no bar, no menus and no Xwayland, rendering on the GPU. Hermes reports its work over MCP (see [MCP.md](MCP.md)). [PLAN.md](PLAN.md) has the design; the [project board](https://github.com/orgs/ideaconnect/projects/7) tracks progress.
 
@@ -22,6 +23,8 @@ hermes-beaver demo --scenario busy|idle|overflow|broken|empty
 hermes-beaver mcp              # MCP server on stdio (Hermes starts this)
 hermes-beaver call <tool> ['<json>']  # one tool call, for scripts (JSON defaults to {})
 hermes-beaver display off|on|vacation   # switch the monitor, print one line
+hermes-beaver web              # the dashboard as a read-only web page ([web] listen)
+hermes-beaver web --demo [--scenario busy|…]   # the same on made-up data
 ```
 
 Global options: `--config <path>` (default `~/.config/hermes-beaver/config.toml`) and `--store <path>` (default `~/.local/state/hermes-beaver/events.db`).
@@ -32,6 +35,7 @@ Global options: `--config <path>` (default `~/.config/hermes-beaver/config.toml`
 make test      # unit and integration tests
 make lint      # rustfmt + clippy
 make demo      # run the demo locally (works under WSLg)
+make demo-web  # the web view on made-up data: http://127.0.0.1:8788/
 ```
 
 ## Deploying
@@ -45,9 +49,10 @@ make deploy
 ```
 
 `make deploy` builds a release locally, copies it to the host, and runs [`deploy/install.sh`](deploy/install.sh) there as root. The script:
-- installs `sway`, `ddcutil` (brightness) and `wlopm` (standby), without recommended packages, so no Xwayland;
+- installs `sway` and `ddcutil` (brightness), without recommended packages, so no Xwayland. Standby goes through sway's IPC socket;
 - installs the binary, its systemd user unit, and the sway config [`deploy/sway.conf`](deploy/sway.conf) plus the host's `secrets/sway.conf` (outputs and modes);
 - replaces the display manager with the kiosk session: [`hermes-beaver-kiosk.service`](deploy/hermes-beaver-kiosk.service) runs sway on tty7 as the desktop user. LightDM is disabled and masked, so no X server starts. Sway starts the dashboard;
+- installs and enables the web view's user unit, [`hermes-beaver-web.service`](deploy/hermes-beaver-web.service), and restarts it. Lingering starts it at boot, without sway;
 - restarts sway only when its config changed, otherwise just the dashboard.
 
 Run it again at any time; it's idempotent. To go back to X: `systemctl disable --now hermes-beaver-kiosk && systemctl unmask lightdm && systemctl enable --now lightdm`, after reinstalling LightDM and a desktop if you removed them, and deploy a build with Slint's `backend-winit-x11`. When a release adds MCP tools, send `/reload-mcp` to Hermes afterwards so the model sees them.
@@ -88,4 +93,21 @@ on_at = "09:00"              # leave it out to stay off until turned on
 renderer = "software"        # software (~40 MB RSS) | opengl (~110 MB, draws on the GPU); SLINT_BACKEND overrides
 animal = "beaver"            # the ASCII animal: beaver | squirrel
 animal_name = "Beaver"       # its panel's title (shown in capitals); default: the animal's name
+
+[web]
+listen = "127.0.0.1:8788"    # `hermes-beaver web`; set the LAN address to open it from other computers
 ```
+
+## Web view
+
+`hermes-beaver web` serves the dashboard as a page for other computers and phones on the LAN, at the address in `[web] listen`. It's read-only: no buttons, no login, no TLS, so keep it on the LAN. It runs as its own process, so it keeps working while the kiosk or sway is down, and it never writes to the store (reconciliation stays with the kiosk).
+
+The page shows what the kiosk shows, plus:
+- **Full lists** instead of "+N more" (finished tasks still stop at `finished_rows`). Wide windows get the kiosk's grid; narrow ones, a phone included, one column with "Needs you" first.
+- The **monitor's state**: "Screen on until 23:00", "Screen in standby until 09:00", "Screen off: vacation". It's the requested and scheduled state: a key press on the dashboard machine can light the screen for a while without changing it.
+- **Links** to GitHub on a task's issue or PR (only `https://github.com/` links; titles stay masked).
+- The host's time, and how old the data is: amber after 30 s without an update, "*name* not responding" after 2 minutes. The browser tab's title counts what needs you, `(2) Beaver · hermes`, and gets a `⚠` while the health banner is up.
+
+The page polls `/state.json` every 5 s. That JSON is the page's own feed, not an API: its shape changes with the page. Scripts use MCP or `call`. After a deploy, open pages reload themselves.
+
+It answers only to an IP address or a LAN name (a single label such as `hermes`, or `*.local`, `*.lan`, `*.home`, `*.home.arpa`, `*.internal`). A request under any other host name, which is what DNS rebinding from a web page looks like, gets 403. To put it behind a reverse proxy under a public name later, have the proxy send the upstream's address as `Host`, and add a login there.

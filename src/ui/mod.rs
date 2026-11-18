@@ -1,13 +1,10 @@
 //! The Slint app shell and the 10-second refresh loop.
 
-mod demo;
-mod view;
-
 use std::cell::RefCell;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use slint::{ComponentHandle, ModelRc, Rgba8Pixel, SharedPixelBuffer, Timer, TimerMode, VecModel};
@@ -15,21 +12,11 @@ use slint::{ComponentHandle, ModelRc, Rgba8Pixel, SharedPixelBuffer, Timer, Time
 use crate::brightness::{self, Controller, Levels};
 use crate::config::{Config, Renderer};
 use crate::display::{self, Change, Schedule, Screen};
-use crate::health::{self, Health};
-use crate::hermes::HermesReader;
-use crate::metrics::{self, Metrics, Source};
-use crate::reconcile;
-use crate::store::views::Snapshot;
-use crate::store::{self, Store};
+use crate::feed::{Access, Feed, Mode};
+use crate::store;
+use crate::view::{self, Fit};
 
 slint::include_modules!();
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Mode {
-    Live,
-    /// `None` cycles through every scenario.
-    Demo(Option<String>),
-}
 
 /// Events that brighten the screen.
 const WAKE_EVENTS: &[&str] = &[
@@ -43,17 +30,7 @@ const TICK: Duration = Duration::from_secs(10);
 
 struct App {
     config: Config,
-    store: Option<Store>,
-    store_path: PathBuf,
-    store_error: Option<String>,
-    db_stamp: Option<(Option<SystemTime>, Option<SystemTime>)>,
-    hermes: Option<HermesReader>,
-    demo: Option<demo::Demo>,
-    source: Box<dyn Source>,
-    metrics: Metrics,
-    gpu_shown: bool,
-    snapshot: Snapshot,
-    health: Option<Health>,
+    feed: Feed,
     last_event_id: Option<i64>,
     brightness: Option<Controller>,
     /// Monitor power (live mode only).
@@ -76,7 +53,7 @@ pub fn run(
         eprintln!("hermes-beaver: setting the app id failed: {e}");
     }
     let mut app = App::new(config.clone(), &mode, store_path, window.as_weak())?;
-    let host = hostname();
+    let host = view::hostname();
     window.set_hostname(match mode {
         Mode::Live => host.into(),
         Mode::Demo(_) => format!("{host} · demo").into(),
@@ -113,6 +90,19 @@ pub fn run(
             woke
         }
     });
+    // With the outputs off the window gets keys but no pointer events: the
+    // compositor's idle notifications cover the mouse.
+    if app.borrow().screen.is_some() {
+        let weak = window.as_weak();
+        let started = crate::idle::watch(move || {
+            let _ = weak.upgrade_in_event_loop(|w| {
+                w.invoke_user_input();
+            });
+        });
+        if let Err(e) = started {
+            eprintln!("hermes-beaver: the mouse won't wake the monitor: {e:#}");
+        }
+    }
 
     // First metrics shortly after start, then every 10 s.
     let tick = {
@@ -178,126 +168,46 @@ impl App {
         store_path: &Path,
         window: slint::Weak<MainWindow>,
     ) -> Result<Self> {
-        let base = |store, store_error, source: Box<dyn Source>, metrics, gpu_shown| Self {
-            config: config.clone(),
-            store,
-            store_path: store_path.to_path_buf(),
-            store_error,
-            db_stamp: None,
-            hermes: None,
-            demo: None,
-            source,
-            metrics,
-            gpu_shown,
-            snapshot: Snapshot::default(),
-            health: None,
+        let feed = Feed::new(&config, mode, store_path, Access::ReadWrite)?;
+        let mut app = Self {
+            schedule: config.schedule(),
+            config,
+            feed,
             last_event_id: None,
             brightness: None,
             screen: None,
-            schedule: config.schedule(),
         };
-        Ok(match mode {
-            Mode::Live => {
-                let (store, err) = match Store::open(store_path) {
-                    Ok(s) => (Some(s), None),
-                    Err(e) => (None, Some(format!("cannot open the event store: {e:#}"))),
-                };
-                let source = metrics::SystemSource::new(&config.metrics.disk);
-                let mut app = base(
-                    store,
-                    err,
-                    Box::new(source),
-                    Metrics::default(),
-                    metrics::gpu::available(),
-                );
-                app.hermes = Some(HermesReader::new(
-                    config.hermes_home(),
-                    config.hermes.agent_jobs.clone(),
-                ));
-                let method = config.brightness.method;
-                let dim = brightness::Dim::new(move |opacity| {
-                    let _ = window.upgrade_in_event_loop(move |w| w.set_dim(opacity));
-                });
-                app.brightness = Some(Controller::start(
-                    Levels::from(&config.brightness),
-                    move |pause| brightness::select(method, dim, pause),
-                ));
-                app.screen = Some(Screen::new(Box::new(display::OutputPower)));
-                app
-            }
-            Mode::Demo(scenario) => {
-                let fixed = scenario.as_deref().map(demo::Scenario::parse).transpose()?;
-                let (demo, store) = demo::Demo::new(fixed)?;
-                let mut source = demo::DemoSource::new();
-                let mut m = Metrics::default();
-                demo::prefill(&mut m, &mut source);
-                let mut app = base(Some(store), None, Box::new(source), m, true);
-                app.demo = Some(demo);
-                app
-            }
-        })
+        if *mode == Mode::Live {
+            let method = app.config.brightness.method;
+            let dim = brightness::Dim::new(move |opacity| {
+                let _ = window.upgrade_in_event_loop(move |w| w.set_dim(opacity));
+            });
+            app.brightness = Some(Controller::start(
+                Levels::from(&app.config.brightness),
+                move |pause| brightness::select(method, dim, pause),
+            ));
+            app.screen = match display::SwayPower::from_env() {
+                Ok(power) => Some(Screen::new(Box::new(power))),
+                Err(e) => {
+                    eprintln!("hermes-beaver: no monitor standby: {e:#}");
+                    None
+                }
+            };
+        }
+        Ok(app)
     }
 
     fn sample_metrics(&mut self) {
-        let s = self.source.sample();
-        self.metrics.record(s);
+        self.feed.sample_metrics();
     }
 
     /// Re-reads health and (if it changed) the store. Returns whether to wake the screen.
     fn refresh(&mut self, now: i64) -> bool {
-        let mut force_reload = false;
-
-        // Health (and reconciliation, which needs the same ledger).
-        let mut health = if let Some(demo) = &mut self.demo {
-            if let Some(store) = &mut self.store {
-                match demo.advance(store) {
-                    Ok(true) => force_reload = true,
-                    Ok(false) => {}
-                    Err(e) => eprintln!("hermes-beaver: demo: {e:#}"),
-                }
-            }
-            demo.health()
-        } else if let Some(hermes) = &mut self.hermes {
-            let st = hermes.poll();
-            if let Some(store) = &mut self.store {
-                match reconcile::reconcile(store, &st.executions, now) {
-                    Ok(0) => {}
-                    Ok(n) => {
-                        eprintln!("hermes-beaver: reconciled {n} task(s) from the cron ledger");
-                        force_reload = true;
-                    }
-                    Err(e) => eprintln!("hermes-beaver: reconcile: {e:#}"),
-                }
-            }
-            health::evaluate(
-                &st,
-                Duration::from_secs(self.config.hermes.heartbeat_max_age_secs),
-                !self.config.hermes.agent_jobs.is_empty(),
-            )
-        } else {
-            Health::default()
-        };
-        if let Some(e) = &self.store_error {
-            health.problems.push(e.clone());
-        }
-        let mut wake = matches!(&self.health, Some(old) if *old != health);
-        self.health = Some(health);
-
-        // Store: re-query only when another process (or we) wrote to it.
-        let Some(store) = &self.store else {
+        let mut wake = self.feed.refresh(now);
+        let Some(store) = self.feed.store() else {
             return wake;
         };
-        let stamp = db_stamp(&self.store_path);
-        if force_reload || self.demo.is_some() || self.db_stamp != Some(stamp) {
-            match store.snapshot(self.config.tasks.finished_rows) {
-                Ok(snap) => {
-                    self.snapshot = snap;
-                    self.db_stamp = Some(stamp);
-                }
-                Err(e) => eprintln!("hermes-beaver: reading the store: {e:#}"),
-            }
-        }
-        let latest = self.snapshot.last_event_id;
+        let latest = self.feed.state.snapshot.last_event_id;
         if let Some(seen) = self.last_event_id
             && latest > seen
         {
@@ -314,7 +224,7 @@ impl App {
     /// and the daily schedule. A new request applies its state again even when the
     /// wanted state doesn't change, so `display_on` wakes a monitor that stayed dark.
     fn sync_screen(&mut self, now: i64) -> Change {
-        let req = &self.snapshot.display;
+        let req = &self.feed.state.snapshot.display;
         let want_off = display::wants_off(req, &self.schedule, now);
         match &mut self.screen {
             Some(s) => s.sync(want_off, req.since, now),
@@ -323,50 +233,58 @@ impl App {
     }
 
     fn render(&self, w: &MainWindow, now: i64) {
-        let snap = &self.snapshot;
-        let health = self.health.clone().unwrap_or_default();
-        let stale = self.config.tasks.stale_after_mins as i64 * 60;
-
-        let (tasks, tasks_hint) = view::task_items(snap, now, stale);
-        let (needs, needs_hint) = view::need_items(snap, now);
-        let done_rows = view::done_rows(
-            needs.len(),
-            !needs_hint.is_empty(),
-            self.config.tasks.finished_rows,
-        );
-        let (done, done_hint) = view::done_items(snap, now, done_rows);
-        let mood = view::mood(&health, snap);
-        let (caption, tone) = view::mascot_caption(mood, snap);
-
-        w.set_banner(health.banner().into());
-        w.set_tasks(model(tasks));
-        w.set_tasks_hint(tasks_hint.into());
-        w.set_needs(model(needs));
-        w.set_needs_hint(needs_hint.into());
-        w.set_done(model(done));
-        w.set_done_hint(done_hint.into());
-        w.set_metrics(model(view::metric_items(
-            &self.metrics,
-            self.gpu_shown,
+        let d = view::dashboard(
+            &self.feed.state,
+            &self.config,
+            now,
+            Fit::Screen,
             view::loadavg(),
-        )));
-        w.set_mascot_art(view::mascot_art(self.config.ui.animal, mood).into());
-        w.set_mascot_caption(caption.into());
-        w.set_mascot_tone(tone);
-        w.set_counter(snap.done_count.to_string().into());
-        w.set_counter_label(view::counter_label(snap.go_live_at).into());
+        );
+        w.set_banner(d.banner.into());
+        w.set_tasks(model(d.tasks, |t| TaskItem {
+            badge: t.badge.into(),
+            title: t.title.into(),
+            meta: t.meta.into(),
+            status: t.status.into(),
+            tone: t.tone,
+        }));
+        w.set_tasks_hint(d.tasks_hint.into());
+        w.set_needs(model(d.needs, |n| NeedItem {
+            label: n.label.into(),
+            title: n.title.into(),
+            detail: n.detail.into(),
+            age: n.age.into(),
+            tone: n.tone,
+        }));
+        w.set_needs_hint(d.needs_hint.into());
+        w.set_done(model(d.done, |t| DoneItem {
+            badge: t.badge.into(),
+            title: t.title.into(),
+            outcome: t.outcome.into(),
+            age: t.age.into(),
+            tone: t.tone,
+        }));
+        w.set_done_hint(d.done_hint.into());
+        w.set_metrics(model(d.metrics, |m| MetricItem {
+            label: m.label.into(),
+            value: m.value,
+            text: m.text.into(),
+            detail: m.detail.into(),
+            spark: m.spark.into(),
+            shown: m.shown,
+        }));
+        w.set_mascot_art(d.mascot_art.into());
+        w.set_mascot_caption(d.mascot_caption.into());
+        w.set_mascot_tone(d.mascot_tone);
+        w.set_counter(d.counter.into());
+        w.set_counter_label(d.counter_label.into());
     }
 }
 
-fn model<T: Clone + 'static>(v: Vec<T>) -> ModelRc<T> {
-    ModelRc::from(Rc::new(VecModel::from(v)))
-}
-
-fn db_stamp(db: &Path) -> (Option<SystemTime>, Option<SystemTime>) {
-    let m = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    let mut wal = db.as_os_str().to_owned();
-    wal.push("-wal");
-    (m(db), m(Path::new(&wal)))
+/// The view's rows as a Slint model.
+fn model<T, U: Clone + 'static>(rows: Vec<T>, to_slint: impl Fn(T) -> U) -> ModelRc<U> {
+    let rows: Vec<U> = rows.into_iter().map(to_slint).collect();
+    ModelRc::from(Rc::new(VecModel::from(rows)))
 }
 
 /// SIGTERM/SIGINT/SIGHUP end the event loop cleanly, so brightness and monitor power are restored.
@@ -403,12 +321,6 @@ fn select_backend(renderer: Renderer) {
     if let Err(e) = chosen {
         eprintln!("hermes-beaver: renderer `{name}` unavailable ({e}); using the default");
     }
-}
-
-fn hostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|s| s.trim().to_owned())
-        .unwrap_or_else(|_| "hermes".into())
 }
 
 /// Shows the time and schedules itself just after the next wall-clock second, so the
