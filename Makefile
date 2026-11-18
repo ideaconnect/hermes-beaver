@@ -5,7 +5,7 @@ BIN   := target/release/hermes-beaver
 STAGE := /tmp/hermes-beaver-deploy
 SSH   := ssh -o BatchMode=yes
 
-.PHONY: build test lint demo demo-web deploy check-env
+.PHONY: build test lint demo demo-web deploy check-env desktop desktop-test
 
 build:
 	cargo build --release
@@ -16,6 +16,13 @@ test:
 lint:
 	cargo fmt --check
 	cargo clippy --all-targets -- -D warnings
+
+# The desktop app (desktop/, a crate of its own; needs the WebKitGTK headers on Linux).
+desktop:
+	cd desktop && cargo build --release
+
+desktop-test:
+	cd desktop && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 
 demo:
 	cargo run --release -- demo
