@@ -883,6 +883,8 @@ mod tests {
         );
         let r = call_at(&mut s, "display_on", json!({}), 5000).unwrap();
         assert_eq!(r["changed"], false);
+        // Still a newer request: the dashboard applies it again (a dark monitor wakes).
+        assert_eq!(display(&s).since, 5000);
     }
 
     /// 2030-01-`day` `hh`:00 in the local time zone.

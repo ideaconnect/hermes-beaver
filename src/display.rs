@@ -21,6 +21,10 @@
 //! drifted. The compositor never blanks the dashboard on its own: the kiosk session
 //! runs no idle daemon.
 //!
+//! A new request from the owner applies its state again even when the wanted state
+//! stays the same (its `since` moved): `display_on` wakes a monitor that stayed dark
+//! at once, without waiting for the next read-back (issue #33).
+//!
 //! A key press or pointer move wakes a monitor in standby without changing the
 //! requested state. After [`INPUT_WAKE_SECS`] without input it goes back into
 //! standby (the X DPMS timeout the dashboard had before Wayland). Keys reach the
@@ -265,6 +269,8 @@ pub struct Screen {
     power: Box<dyn Power>,
     /// Last applied state, `Some(true)` = off. `None` before the first sync.
     off: Option<bool>,
+    /// When the owner made the request applied last (`Request::since`).
+    asked: Option<i64>,
     /// Woken by input while it should be off: the time of the last input.
     woken: Option<i64>,
     /// When input last woke it.
@@ -280,6 +286,7 @@ impl Screen {
         Self {
             power,
             off: None,
+            asked: None,
             woken: None,
             woke_at: None,
             checked: None,
@@ -311,11 +318,15 @@ impl Screen {
         woke || self.woke_at.is_some_and(|t| now - t <= WAKE_GESTURE_SECS)
     }
 
-    /// The first call applies the state either way: after a restart the monitor
-    /// may still be in standby from the previous run. A monitor woken by input goes
-    /// back into standby after [`INPUT_WAKE_SECS`] without input.
-    pub fn sync(&mut self, want_off: bool, now: i64) -> Change {
-        if self.off == Some(want_off) {
+    /// Applies `want_off` when it changes and when the owner asked again (`asked`, the
+    /// time of their latest request, moved). The first call applies the state either
+    /// way: after a restart the monitor may still be in standby from the previous run.
+    /// A monitor woken by input goes back into standby after [`INPUT_WAKE_SECS`]
+    /// without input.
+    pub fn sync(&mut self, want_off: bool, asked: i64, now: i64) -> Change {
+        let again = self.asked.is_some_and(|a| a != asked);
+        self.asked = Some(asked);
+        if self.off == Some(want_off) && !again {
             if !self.woken.is_some_and(|last| now - last >= INPUT_WAKE_SECS) {
                 self.verify(now);
                 return Change::None;
@@ -620,16 +631,16 @@ mod tests {
     fn applies_only_changes_and_restores_on_drop() {
         let (mut s, log) = screen();
         assert_eq!(
-            s.sync(false, 0),
+            s.sync(false, 0, 0),
             Change::None,
             "startup: on, nothing to report"
         );
-        assert_eq!(s.sync(false, 0), Change::None);
-        assert_eq!(s.sync(true, 0), Change::TurnedOff);
+        assert_eq!(s.sync(false, 0, 0), Change::None);
+        assert_eq!(s.sync(true, 0, 0), Change::TurnedOff);
         assert!(s.is_off());
-        assert_eq!(s.sync(true, 0), Change::None);
-        assert_eq!(s.sync(false, 0), Change::TurnedOn);
-        assert_eq!(s.sync(true, 0), Change::TurnedOff);
+        assert_eq!(s.sync(true, 0, 0), Change::None);
+        assert_eq!(s.sync(false, 0, 0), Change::TurnedOn);
+        assert_eq!(s.sync(true, 0, 0), Change::TurnedOff);
         drop(s);
         assert_eq!(calls(&log), vec![true, false, true, false, true]);
     }
@@ -637,7 +648,7 @@ mod tests {
     #[test]
     fn starting_while_asleep_turns_it_off() {
         let (mut s, log) = screen();
-        assert_eq!(s.sync(true, 0), Change::TurnedOff);
+        assert_eq!(s.sync(true, 0, 0), Change::TurnedOff);
         assert_eq!(calls(&log), vec![false]);
     }
 
@@ -654,35 +665,35 @@ mod tests {
             }
         }
         let mut s = Screen::new(Box::new(Broken(0)));
-        assert_eq!(s.sync(true, 0), Change::TurnedOff);
-        assert_eq!(s.sync(true, 0), Change::None);
+        assert_eq!(s.sync(true, 0, 0), Change::TurnedOff);
+        assert_eq!(s.sync(true, 0, 0), Change::None);
     }
 
     #[test]
     fn input_wakes_standby_until_a_quiet_spell() {
         let (mut s, log) = screen();
         assert!(!s.input(0), "already on: nothing to wake");
-        assert_eq!(s.sync(true, 0), Change::TurnedOff);
+        assert_eq!(s.sync(true, 0, 0), Change::TurnedOff);
         assert!(s.input(100), "woke the monitor");
         assert!(!s.is_off());
         assert!(!s.input(200), "already awake");
         // Each input restarts the quiet spell.
-        assert_eq!(s.sync(true, 200 + INPUT_WAKE_SECS - 1), Change::None);
-        assert_eq!(s.sync(true, 200 + INPUT_WAKE_SECS), Change::TurnedOff);
+        assert_eq!(s.sync(true, 0, 200 + INPUT_WAKE_SECS - 1), Change::None);
+        assert_eq!(s.sync(true, 0, 200 + INPUT_WAKE_SECS), Change::TurnedOff);
         assert!(s.is_off());
-        assert_eq!(s.sync(true, 200 + 2 * INPUT_WAKE_SECS), Change::None);
+        assert_eq!(s.sync(true, 0, 200 + 2 * INPUT_WAKE_SECS), Change::None);
         assert_eq!(calls(&log), vec![false, true, false]);
     }
 
     #[test]
     fn a_requested_change_ends_an_input_wake() {
         let (mut s, log) = screen();
-        s.sync(true, 0);
+        s.sync(true, 0, 0);
         s.input(10);
-        assert_eq!(s.sync(false, 20), Change::TurnedOn);
+        assert_eq!(s.sync(false, 0, 20), Change::TurnedOn);
         // Off again later: input wakes it again, the quiet spell starts afresh.
-        assert_eq!(s.sync(true, 30), Change::TurnedOff);
-        assert_eq!(s.sync(true, 30 + INPUT_WAKE_SECS), Change::None);
+        assert_eq!(s.sync(true, 0, 30), Change::TurnedOff);
+        assert_eq!(s.sync(true, 0, 30 + INPUT_WAKE_SECS), Change::None);
         assert!(s.input(40));
         drop(s);
         // Dropping an input-woken screen doesn't switch it again: it's on.
@@ -693,29 +704,29 @@ mod tests {
     fn a_switch_that_didnt_stick_is_made_again_every_minute() {
         let (mut s, log) = screen();
         log.lock().unwrap().power = vec![true];
-        s.sync(false, 0);
-        assert_eq!(s.sync(true, 10), Change::TurnedOff);
+        s.sync(false, 0, 0);
+        assert_eq!(s.sync(true, 0, 10), Change::TurnedOff);
         // The morning switch doesn't reach the monitor.
         log.lock().unwrap().stuck = true;
-        assert_eq!(s.sync(false, 100), Change::TurnedOn);
-        assert_eq!(s.sync(false, 100 + VERIFY_SECS - 1), Change::None);
+        assert_eq!(s.sync(false, 0, 100), Change::TurnedOn);
+        assert_eq!(s.sync(false, 0, 100 + VERIFY_SECS - 1), Change::None);
         assert_eq!(calls(&log), vec![true, false, true], "too early to check");
-        s.sync(false, 100 + VERIFY_SECS);
+        s.sync(false, 0, 100 + VERIFY_SECS);
         assert_eq!(
             calls(&log),
             vec![true, false, true, true],
             "read back off: on again"
         );
-        s.sync(false, 100 + 2 * VERIFY_SECS);
+        s.sync(false, 0, 100 + 2 * VERIFY_SECS);
         assert_eq!(
             calls(&log).len(),
             5,
             "still off: once a minute, not every tick"
         );
         log.lock().unwrap().stuck = false;
-        s.sync(false, 100 + 3 * VERIFY_SECS);
+        s.sync(false, 0, 100 + 3 * VERIFY_SECS);
         assert_eq!(log.lock().unwrap().power, vec![true]);
-        s.sync(false, 100 + 4 * VERIFY_SECS);
+        s.sync(false, 0, 100 + 4 * VERIFY_SECS);
         assert_eq!(
             calls(&log).len(),
             6,
@@ -728,21 +739,40 @@ mod tests {
     fn a_requested_change_starts_without_an_old_drift() {
         let (mut s, log) = screen();
         log.lock().unwrap().power = vec![true];
-        s.sync(false, 0);
+        s.sync(false, 0, 0);
         log.lock().unwrap().power = vec![false];
-        s.sync(false, VERIFY_SECS);
+        s.sync(false, 0, VERIFY_SECS);
         assert!(s.drifting, "reported");
-        assert_eq!(s.sync(true, VERIFY_SECS + 1), Change::TurnedOff);
+        assert_eq!(s.sync(true, 0, VERIFY_SECS + 1), Change::TurnedOff);
         assert!(!s.drifting, "the next drift is reported afresh");
+    }
+
+    #[test]
+    fn a_repeated_request_applies_its_state_again() {
+        let (mut s, log) = screen();
+        log.lock().unwrap().power = vec![true];
+        s.sync(false, 0, 0);
+        // Dark while the dashboard believes it's on, before the next read-back.
+        log.lock().unwrap().power = vec![false];
+        // `display_on` while on: a newer request, the same wanted state.
+        assert_eq!(s.sync(false, 5, 10), Change::TurnedOn);
+        assert_eq!(log.lock().unwrap().power, vec![true], "on at once");
+        assert_eq!(s.sync(false, 5, 20), Change::None, "the same request");
+        // `display_off` during an input wake ends the wake.
+        s.sync(true, 5, 30);
+        assert!(s.input(40));
+        assert_eq!(s.sync(true, 50, 50), Change::TurnedOff);
+        assert!(s.is_off());
+        assert_eq!(calls(&log), vec![true, true, false, true, false]);
     }
 
     #[test]
     fn a_monitor_that_came_back_on_by_itself_goes_off_again() {
         let (mut s, log) = screen();
         log.lock().unwrap().power = vec![true];
-        s.sync(true, 0);
+        s.sync(true, 0, 0);
         log.lock().unwrap().power = vec![true];
-        s.sync(true, VERIFY_SECS);
+        s.sync(true, 0, VERIFY_SECS);
         assert_eq!(calls(&log), vec![false, false]);
         assert_eq!(log.lock().unwrap().power, vec![false]);
     }
@@ -751,9 +781,9 @@ mod tests {
     fn checking_leaves_an_input_wake_alone() {
         let (mut s, log) = screen();
         log.lock().unwrap().power = vec![true];
-        s.sync(true, 0);
+        s.sync(true, 0, 0);
         assert!(s.input(10));
-        assert_eq!(s.sync(true, 10 + VERIFY_SECS), Change::None);
+        assert_eq!(s.sync(true, 0, 10 + VERIFY_SECS), Change::None);
         assert_eq!(
             calls(&log),
             vec![false, true],
@@ -764,16 +794,16 @@ mod tests {
     #[test]
     fn no_outputs_means_nothing_to_fix() {
         let (mut s, log) = screen();
-        s.sync(false, 0);
-        s.sync(true, 1);
-        s.sync(true, 1 + 5 * VERIFY_SECS);
+        s.sync(false, 0, 0);
+        s.sync(true, 0, 1);
+        s.sync(true, 0, 1 + 5 * VERIFY_SECS);
         assert_eq!(calls(&log), vec![true, false]);
     }
 
     #[test]
     fn input_right_after_the_wake_belongs_to_it() {
         let (mut s, log) = screen();
-        s.sync(true, 0);
+        s.sync(true, 0, 0);
         assert!(s.input(100), "woke it");
         assert!(s.input(101), "the key right after: swallowed too");
         assert!(!s.input(103), "later input is ordinary input");
