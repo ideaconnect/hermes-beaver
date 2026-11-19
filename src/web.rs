@@ -115,7 +115,8 @@ struct PageState<'a> {
     name: &'a str,
     mascot_title: &'a str,
     mascot_font_px: f32,
-    /// The monitor's state, e.g. "Screen in standby until 09:00".
+    /// The monitor's state, e.g. "Screen in standby until 09:00". Empty (the page hides
+    /// it) when the config leaves the monitor alone.
     screen: String,
     #[serde(flatten)]
     dashboard: Dashboard,
@@ -275,7 +276,12 @@ impl Site {
             name: &self.name,
             mascot_title: &self.mascot_title,
             mascot_font_px: view::mascot_font_px(self.config.ui.animal),
-            screen: display::status_line(&state.snapshot.display, &self.schedule, now),
+            screen: if self.config.display.enabled {
+                display::status_line(&state.snapshot.display, &self.schedule, now)
+            } else {
+                // Nothing switches the monitor: there's no state to tell.
+                String::new()
+            },
             dashboard: view::dashboard(&state, &self.config, now, Fit::All, view::loadavg()),
         }
     }
@@ -460,6 +466,17 @@ mod tests {
         assert!(v["screen"].as_str().unwrap().starts_with("Screen on"));
         assert_eq!(v["needs_you"], 0);
         assert_eq!(v["metrics"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn no_screen_state_when_the_monitor_is_left_alone() {
+        let mut config = Config::default();
+        config.display.enabled = false;
+        config.display.off_at = Some("23:00".into());
+        let site = Site::new(&config, &Mode::Live, "1.0-abc".into(), State::default());
+        let r = get(&site, "/state.json", None);
+        let v: Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v["screen"], "", "the page hides an empty one");
     }
 
     #[test]

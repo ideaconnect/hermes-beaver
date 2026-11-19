@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::NaiveTime;
 use serde::Deserialize;
 
-use crate::display::Schedule;
+use crate::display::{Monitor, Schedule};
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -52,12 +52,27 @@ impl Default for WebConfig {
 /// Shorter tokens could be guessed: the web view doesn't limit attempts.
 pub const MIN_TOKEN_LEN: usize = 16;
 
-/// Daily monitor standby. Times are "HH:MM"; either may be left out.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+/// The monitor's power: whether the dashboard switches it at all, and a daily standby.
+/// Times are "HH:MM"; either may be left out.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DisplayConfig {
+    /// `false`: the dashboard never switches the monitor on or off, neither on the
+    /// schedule nor on a request (`/sleep`, `/awake`, `/vacation`) nor on input. The
+    /// times may stay in the file for when it's turned back on.
+    pub enabled: bool,
     pub off_at: Option<String>,
     pub on_at: Option<String>,
+}
+
+impl Default for DisplayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            off_at: None,
+            on_at: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -286,6 +301,14 @@ impl Config {
         self.try_schedule().unwrap_or_default()
     }
 
+    /// `[display]`: whether the dashboard switches the monitor, and its schedule.
+    pub fn monitor(&self) -> Monitor {
+        Monitor {
+            enabled: self.display.enabled,
+            schedule: self.schedule(),
+        }
+    }
+
     fn try_schedule(&self) -> Result<Schedule> {
         let parse = |key: &str, v: &Option<String>| -> Result<Option<NaiveTime>> {
             match v.as_deref().map(str::trim) {
@@ -427,6 +450,28 @@ mod tests {
         let err = |text: &str| format!("{:#}", Config::parse(text).unwrap_err());
         assert!(err("[display]\noff_at = \"11pm\"").contains("like \"23:00\""));
         assert!(err("[display]\noff_at = \"09:00\"\non_at = \"09:00\"").contains("must differ"));
+    }
+
+    #[test]
+    fn the_monitor_can_be_left_alone() {
+        assert!(Config::default().display.enabled, "switched by default");
+        assert_eq!(Config::default().monitor(), Monitor::default());
+        let c = Config::parse("[display]\nenabled = false\noff_at = \"23:00\"\non_at = \"09:00\"")
+            .unwrap();
+        let m = c.monitor();
+        assert!(!m.enabled);
+        assert_eq!(
+            m.schedule.off_at,
+            NaiveTime::from_hms_opt(23, 0, 0),
+            "the times stay for later"
+        );
+        assert!(
+            Config::parse("[display]\nenabled = true")
+                .unwrap()
+                .monitor()
+                .enabled
+        );
+        assert!(Config::parse("[display]\nenabled = \"no\"").is_err());
     }
 
     #[test]

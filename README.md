@@ -11,7 +11,7 @@ A lightweight, full-screen dashboard that runs next to [Hermes Agent](https://gi
 - a read-only web page with the same dashboard, for the other computers and phones on your LAN;
 - a desktop app ([Tauri](https://tauri.app), on the system's web view) that opens that page in a window of its own or full screen, with a token.
 
-It dims the monitor backlight over DDC/CI (`ddcutil`, which talks to the monitor over the cable, whatever the display server) when nothing is happening, and brightens it for a minute when something changes. The monitor goes into standby on a daily schedule (e.g. 23:00 to 09:00) and whenever you tell Hermes you're going to sleep or out (`/sleep`, `/awake`). Vacation mode (`/vacation`) keeps it off until you turn it back on. A key press or mouse move on the dashboard machine also wakes it, until ten minutes pass without input. The dashboard checks that the monitor follows: once a minute it reads the outputs' power back from sway and switches again if it doesn't match, so a switch that didn't take hold is caught within a minute. Asking again (`/awake` while the screen should already be on) applies the state again at once.
+It dims the monitor backlight over DDC/CI (`ddcutil`, which talks to the monitor over the cable, whatever the display server) when nothing is happening, and brightens it for a minute when something changes. The monitor goes into standby on a daily schedule (e.g. 23:00 to 09:00) and whenever you tell Hermes you're going to sleep or out (`/sleep`, `/awake`). Vacation mode (`/vacation`) keeps it off until you turn it back on. A key press or mouse move on the dashboard machine also wakes it, until ten minutes pass without input. The dashboard checks that the monitor follows: once a minute it reads the outputs' power back from sway and switches again if it doesn't match, so a switch that didn't take hold is caught within a minute. Asking again (`/awake` while the screen should already be on) applies the state again at once. With `[display] enabled = false` it leaves the monitor alone: no schedule, no `/sleep`, `/awake` or `/vacation`, no wake on input.
 
 Written in Rust with [Slint](https://slint.dev): one binary of about 17 MB that idles at about 0% CPU and about 40 MB RSS (16 MB of it are the two frame buffers it shares with the compositor). It's a Wayland client. On the host it runs in a kiosk session: [sway](https://swaywm.org) with no bar, no menus and no Xwayland, rendering on the GPU. Hermes reports its work over MCP (see [MCP.md](MCP.md)). [PLAN.md](PLAN.md) has the design; the [project board](https://github.com/orgs/ideaconnect/projects/7) tracks progress.
 
@@ -89,6 +89,7 @@ exit_level = 80
 disk = "auto"                # block device behind /
 
 [display]
+enabled = true               # false: never switch the monitor on or off (see Monitor below)
 off_at = "23:00"             # daily standby; both default to none (no schedule)
 on_at = "09:00"              # leave it out to stay off until turned on
 
@@ -101,6 +102,17 @@ animal_name = "Beaver"       # its panel's title (shown in capitals); default: t
 listen = "127.0.0.1:8788"    # `hermes-beaver web`; set the LAN address to open it from other computers
 token_file = "/etc/secrets/hermes-beaver-web.token"   # require this token; default: none
 ```
+
+### Monitor
+
+`[display] enabled = false` stops the dashboard from switching the monitor, for when it's used for something else or not at all (the web view and the desktop app don't need it):
+- no standby on the schedule, and no waking at `on_at` (the times can stay in the file);
+- `display_off`, `display_on` and `display_vacation` change and store nothing and fail with a message saying why (`call` and `display` exit with 2), so `/sleep`, `/awake` and `/vacation` answer with that message;
+- a key press or mouse move doesn't wake it, and the web view doesn't show the screen's state.
+
+Brightness is separate: `[brightness] method = "off"` stops the DDC/CI dimming as well.
+
+The key is new in this release, and older binaries refuse unknown keys, so install the binary before (or with) the config: `make deploy` does both. To switch the monitor again, remove the line (or set `enabled = true`) and deploy, or edit `~/.config/hermes-beaver/config.toml` on the host and `systemctl --user restart hermes-beaver hermes-beaver-web`. The usual rules apply at once: the later of the schedule's last switch and the last request made before you turned switching off decides, so between `off_at` and `on_at` the monitor goes straight into standby, and a vacation from before holds until `/awake`. `call` reads the config on every run; the MCP server reads it when it starts (`pkill -f 'hermes-beaver mcp'`, and Hermes starts a new one on the next call).
 
 ## Web view
 

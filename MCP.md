@@ -99,6 +99,8 @@ The dashboard may have a daily schedule in its own config, for example off at 23
 
 New tasks never wake the monitor. Requests take effect within 10 seconds. A repeated request applies its state again, even when `changed` is `false`: `display_on` wakes a monitor that stayed dark. These calls aren't tasks: don't call `task_start` for them.
 
+With `[display] enabled = false` in the dashboard's config, the dashboard leaves the monitor alone. The three tools then change and store nothing and fail with a message saying so (`call` exits with 2); tell the owner instead of retrying.
+
 Every display tool returns the same result:
 
 ```json

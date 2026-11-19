@@ -33,7 +33,7 @@ struct App {
     feed: Feed,
     last_event_id: Option<i64>,
     brightness: Option<Controller>,
-    /// Monitor power (live mode only).
+    /// Monitor power (live mode only; none when the config leaves the monitor alone).
     screen: Option<Screen>,
     schedule: Schedule,
 }
@@ -186,13 +186,9 @@ impl App {
                 Levels::from(&app.config.brightness),
                 move |pause| brightness::select(method, dim, pause),
             ));
-            app.screen = match display::SwayPower::from_env() {
-                Ok(power) => Some(Screen::new(Box::new(power))),
-                Err(e) => {
-                    eprintln!("hermes-beaver: no monitor standby: {e:#}");
-                    None
-                }
-            };
+            app.screen = Screen::open(&app.config.monitor(), || {
+                display::SwayPower::from_env().map(|p| Box::new(p) as Box<dyn display::Power>)
+            });
         }
         Ok(app)
     }

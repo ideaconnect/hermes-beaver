@@ -130,10 +130,10 @@ fn main() -> Result<()> {
         }
         Some(Command::Mcp) => {
             let mut store = Store::open(&store_path)?;
-            mcp::serve(&mut store, &config.schedule())
+            mcp::serve(&mut store, &config.monitor())
         }
         Some(Command::Call { tool, json }) => {
-            std::process::exit(run_call(&store_path, &config.schedule(), &tool, &json))
+            std::process::exit(run_call(&store_path, &config.monitor(), &tool, &json))
         }
         Some(Command::Display { action }) => {
             let tool = match action {
@@ -141,7 +141,7 @@ fn main() -> Result<()> {
                 DisplayAction::Off => "display_off",
                 DisplayAction::Vacation => "display_vacation",
             };
-            let code = match run_tool(&store_path, &config.schedule(), tool, Value::Null) {
+            let code = match run_tool(&store_path, &config.monitor(), tool, Value::Null) {
                 Ok(out) => {
                     println!("{}", display::describe(&out, chrono::Local::now()));
                     0
@@ -155,7 +155,7 @@ fn main() -> Result<()> {
 
 fn run_call(
     store_path: &std::path::Path,
-    schedule: &display::Schedule,
+    monitor: &display::Monitor,
     tool: &str,
     json: &str,
 ) -> i32 {
@@ -166,7 +166,7 @@ fn run_call(
             return 2;
         }
     };
-    match run_tool(store_path, schedule, tool, args) {
+    match run_tool(store_path, monitor, tool, args) {
         Ok(out) => {
             println!("{out}");
             0
@@ -178,7 +178,7 @@ fn run_call(
 /// Runs one tool; on failure prints the reason and returns the exit status.
 fn run_tool(
     store_path: &std::path::Path,
-    schedule: &display::Schedule,
+    monitor: &display::Monitor,
     tool: &str,
     args: Value,
 ) -> Result<Value, i32> {
@@ -188,7 +188,7 @@ fn run_tool(
             eprintln!("hermes-beaver: {e:#}");
             1
         })?;
-    tools::call(&mut store, schedule, tool, args).map_err(|e| {
+    tools::call(&mut store, monitor, tool, args).map_err(|e| {
         eprintln!("hermes-beaver: {e}");
         match e {
             ToolError::Internal(_) => 1,
@@ -245,6 +245,20 @@ mod tests {
         );
         assert_eq!(run_call(&db, &Default::default(), "no_such_tool", "{}"), 2);
         assert_eq!(run_call(&db, &Default::default(), "task_start", "{oops"), 2);
+        let left_alone = display::Monitor {
+            enabled: false,
+            ..Default::default()
+        };
+        assert_eq!(run_call(&db, &left_alone, "display_off", "{}"), 2);
+        assert_eq!(
+            run_call(
+                &db,
+                &left_alone,
+                "task_start",
+                r#"{"source":"direct","title":"y"}"#
+            ),
+            0
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 }

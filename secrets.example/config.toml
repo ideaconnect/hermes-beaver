@@ -10,6 +10,7 @@ agent_jobs = ["<cron job id>", "<cron job id>"]   # jobs whose failures raise th
 [display]
 off_at = "23:00"   # daily monitor standby; leave both out for no schedule
 on_at = "09:00"
+# enabled = false  # never switch the monitor: no schedule, /sleep, /awake, /vacation or wake on input
 
 [ui]
 animal = "beaver"        # the ASCII animal: beaver | squirrel
