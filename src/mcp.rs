@@ -9,7 +9,7 @@ use std::io::{BufRead, Write};
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::display::Schedule;
+use crate::display::Monitor;
 use crate::store::Store;
 use crate::tools::{self, ToolError};
 
@@ -25,7 +25,7 @@ const INSTRUCTIONS: &str = concat!(
     "Never include secrets in any text."
 );
 
-pub fn serve(store: &mut Store, schedule: &Schedule) -> Result<()> {
+pub fn serve(store: &mut Store, monitor: &Monitor) -> Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -33,7 +33,7 @@ pub fn serve(store: &mut Store, schedule: &Schedule) -> Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(reply) = handle_line(store, schedule, &line) {
+        if let Some(reply) = handle_line(store, monitor, &line) {
             serde_json::to_writer(&mut stdout, &reply)?;
             stdout.write_all(b"\n")?;
             stdout.flush()?;
@@ -43,7 +43,7 @@ pub fn serve(store: &mut Store, schedule: &Schedule) -> Result<()> {
 }
 
 /// Handles one message; returns the response, or `None` for notifications.
-pub fn handle_line(store: &mut Store, schedule: &Schedule, line: &str) -> Option<Value> {
+pub fn handle_line(store: &mut Store, monitor: &Monitor, line: &str) -> Option<Value> {
     let msg: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => return Some(error(Value::Null, -32700, &format!("parse error: {e}"))),
@@ -89,7 +89,7 @@ pub fn handle_line(store: &mut Store, schedule: &Schedule, line: &str) -> Option
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            match tools::call(store, schedule, name, args) {
+            match tools::call(store, monitor, name, args) {
                 Ok(out) => result(
                     id,
                     json!({
@@ -130,7 +130,7 @@ mod tests {
     use super::*;
 
     fn send(s: &mut Store, msg: Value) -> Option<Value> {
-        handle_line(s, &Schedule::default(), &msg.to_string())
+        handle_line(s, &Monitor::default(), &msg.to_string())
     }
 
     #[test]
@@ -215,6 +215,25 @@ mod tests {
     }
 
     #[test]
+    fn a_monitor_left_alone_says_so_to_the_model() {
+        let mut s = Store::open_in_memory().unwrap();
+        let left_alone = Monitor {
+            enabled: false,
+            ..Monitor::default()
+        };
+        let msg = json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                         "params": {"name": "display_off", "arguments": {}}});
+        let r = handle_line(&mut s, &left_alone, &msg.to_string()).unwrap();
+        assert_eq!(r["result"]["isError"], true);
+        assert!(
+            r["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("doesn't switch the monitor")
+        );
+    }
+
+    #[test]
     fn unknown_version_falls_back_and_bad_input_is_reported() {
         let mut s = Store::open_in_memory().unwrap();
         let init = send(
@@ -224,7 +243,7 @@ mod tests {
         .unwrap();
         assert_eq!(init["result"]["protocolVersion"], FALLBACK_VERSION);
         assert_eq!(
-            handle_line(&mut s, &Schedule::default(), "{not json").unwrap()["error"]["code"],
+            handle_line(&mut s, &Monitor::default(), "{not json").unwrap()["error"]["code"],
             -32700
         );
         let m = send(

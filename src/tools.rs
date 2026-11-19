@@ -4,7 +4,7 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::display::{Mode, Request, Schedule, next_change, wants_off};
+use crate::display::{LEFT_ALONE, Mode, Monitor, Request, Schedule, next_change, wants_off};
 use crate::store::{Store, now, read_display, write_display};
 
 const MAX_TITLE: usize = 300;
@@ -181,25 +181,28 @@ pub fn definitions() -> Vec<ToolDef> {
     ]
 }
 
-/// Runs one tool. `args` must be a JSON object. `schedule` is the monitor's daily
-/// schedule from the config; only the display tools use it.
+/// Runs one tool. `args` must be a JSON object. `monitor` is `[display]` from the
+/// config; only the display tools use it.
 pub fn call(
     store: &mut Store,
-    schedule: &Schedule,
+    monitor: &Monitor,
     name: &str,
     args: Value,
 ) -> Result<Value, ToolError> {
-    call_with(store, schedule, name, args, now())
+    call_with(store, monitor, name, args, now())
 }
 
 /// `call` at a given time, without a monitor schedule.
 pub fn call_at(store: &mut Store, name: &str, args: Value, ts: i64) -> Result<Value, ToolError> {
-    call_with(store, &Schedule::default(), name, args, ts)
+    call_with(store, &Monitor::default(), name, args, ts)
 }
+
+/// The tools that switch the monitor.
+const DISPLAY_TOOLS: &[&str] = &["display_off", "display_on", "display_vacation"];
 
 pub fn call_with(
     store: &mut Store,
-    schedule: &Schedule,
+    monitor: &Monitor,
     name: &str,
     args: Value,
     ts: i64,
@@ -208,6 +211,12 @@ pub fn call_with(
     if !args.is_object() {
         return invalid("arguments must be a JSON object");
     }
+    // Nothing is stored either: turning switching back on later starts from the
+    // requests made before it was turned off, not from ones nobody saw act.
+    if !monitor.enabled && DISPLAY_TOOLS.contains(&name) {
+        return invalid(LEFT_ALONE);
+    }
+    let schedule = &monitor.schedule;
     let tx = store
         .conn
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -902,9 +911,12 @@ mod tests {
     #[test]
     fn display_tools_follow_the_schedule_and_vacation() {
         let mut s = store();
-        let nightly = Schedule {
-            off_at: chrono::NaiveTime::from_hms_opt(23, 0, 0),
-            on_at: chrono::NaiveTime::from_hms_opt(9, 0, 0),
+        let nightly = Monitor {
+            schedule: Schedule {
+                off_at: chrono::NaiveTime::from_hms_opt(23, 0, 0),
+                on_at: chrono::NaiveTime::from_hms_opt(9, 0, 0),
+            },
+            ..Monitor::default()
         };
         let mut at = |name: &str, args: Value, ts: i64| {
             call_with(&mut s, &nightly, name, args, ts).unwrap_or_else(|e| panic!("{name}: {e}"))
@@ -940,6 +952,42 @@ mod tests {
             (Some(true), Some(false))
         );
         assert_eq!(display(&s).mode, Mode::Vacation);
+    }
+
+    #[test]
+    fn display_tools_change_nothing_while_the_monitor_is_left_alone() {
+        let mut s = store();
+        let left_alone = Monitor {
+            enabled: false,
+            ..Monitor::default()
+        };
+        for (name, args) in [
+            ("display_off", json!({})),
+            ("display_off", json!({"until": "2030-01-20T10:00:00Z"})),
+            ("display_on", json!({})),
+            ("display_vacation", json!({})),
+        ] {
+            let e = call_with(&mut s, &left_alone, name, args, 1000).unwrap_err();
+            assert!(matches!(e, ToolError::Invalid(_)), "{name}: exit status 2");
+            assert!(e.to_string().contains("enabled = false"), "{name}: {e}");
+        }
+        assert_eq!(display(&s), Request::default(), "no request stored");
+        assert!(s.event_kinds_since(0).unwrap().is_empty(), "no events");
+        // The other tools work as before.
+        let r = call_with(
+            &mut s,
+            &left_alone,
+            "task_start",
+            json!({"source": "telegram", "title": "x"}),
+            1000,
+        );
+        assert_eq!(r.unwrap()["id"], 1);
+        assert!(
+            call_with(&mut s, &left_alone, "nope", json!({}), 1000)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown tool")
+        );
     }
 
     #[test]

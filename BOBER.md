@@ -124,7 +124,7 @@ quick_commands:
 
 Don't name any of them `wake`: `/wake` is a built-in command (the wake-word listener), and built-ins take precedence.
 
-The dashboard also switches the monitor on its own daily schedule (`[display]` in its config); that needs nothing from Hermes.
+The dashboard also switches the monitor on its own daily schedule (`[display]` in its config); that needs nothing from Hermes. With `[display] enabled = false` it doesn't switch the monitor at all, and the three commands answer that nothing changed.
 
 ## 9. Check
 

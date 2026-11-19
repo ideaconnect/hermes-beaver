@@ -31,6 +31,9 @@
 //! window, which keeps the focus while the outputs are off; the pointer doesn't
 //! (the window is on no output then), so the compositor's idle notifications
 //! report it (see `idle.rs`).
+//!
+//! `[display] enabled = false` in the config turns all of this off: the dashboard
+//! never switches the monitor, and the display tools change nothing (issue #37).
 
 use anyhow::Result;
 use chrono::{DateTime, Days, Local, NaiveTime, TimeZone};
@@ -121,6 +124,27 @@ impl Schedule {
             .last()
     }
 }
+
+/// What the config lets the dashboard do with the monitor (`[display]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Monitor {
+    /// `false`: the dashboard never switches the monitor on or off, and the display
+    /// tools change nothing.
+    pub enabled: bool,
+    pub schedule: Schedule,
+}
+
+impl Default for Monitor {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            schedule: Schedule::default(),
+        }
+    }
+}
+
+/// Why the display tools refuse while the config leaves the monitor alone.
+pub const LEFT_ALONE: &str = "the dashboard doesn't switch the monitor ([display] enabled = false in its config): nothing changed";
 
 /// Whether the monitor should be in standby at `now`.
 pub fn wants_off(req: &Request, schedule: &Schedule, now: i64) -> bool {
@@ -291,6 +315,23 @@ impl Screen {
             woke_at: None,
             checked: None,
             drifting: false,
+        }
+    }
+
+    /// The live dashboard's monitor power. `None` when the config leaves the monitor
+    /// alone, without calling `power` (so nothing ever reaches the compositor), or when
+    /// `power` fails.
+    pub fn open(monitor: &Monitor, power: impl FnOnce() -> Result<Box<dyn Power>>) -> Option<Self> {
+        if !monitor.enabled {
+            eprintln!("hermes-beaver: monitor switching is off ([display] enabled = false)");
+            return None;
+        }
+        match power() {
+            Ok(power) => Some(Self::new(power)),
+            Err(e) => {
+                eprintln!("hermes-beaver: no monitor standby: {e:#}");
+                None
+            }
         }
     }
 
@@ -808,5 +849,27 @@ mod tests {
         assert!(s.input(101), "the key right after: swallowed too");
         assert!(!s.input(103), "later input is ordinary input");
         assert_eq!(calls(&log), vec![false, true], "switched on once");
+    }
+
+    #[test]
+    fn a_monitor_left_alone_never_reaches_the_compositor() {
+        let off = Monitor {
+            enabled: false,
+            schedule: nightly(),
+        };
+        let mut asked = false;
+        let s = Screen::open(&off, || {
+            asked = true;
+            Ok(Box::new(Fake(Arc::default())) as Box<dyn Power>)
+        });
+        assert!(s.is_none());
+        assert!(!asked, "not even connected to sway");
+
+        let s = Screen::open(&Monitor::default(), || {
+            Ok(Box::new(Fake(Arc::default())) as Box<dyn Power>)
+        });
+        assert!(s.is_some(), "switched by default");
+        let failed = Screen::open(&Monitor::default(), || anyhow::bail!("no SWAYSOCK"));
+        assert!(failed.is_none());
     }
 }
